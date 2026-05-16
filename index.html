@@ -16,12 +16,13 @@
 
 <main>
 
-  <!-- Top strip: tiny wordmark + client/config chooser + privacy chip -->
+  <!-- Top strip: wordmark left · privacy pill center · client/config chooser right -->
   <div class="app-strip">
     <div class="wordmark">
       <span class="logo-dot" aria-hidden="true"></span>
       <span>Report Stitcher</span>
     </div>
+    <span class="privacy-pill">All processing stays in your browser</span>
     <span class="client-strip" id="client-strip" hidden>
       <span class="client-strip-label">Client</span>
       <strong id="client-code-display"></strong>
@@ -30,7 +31,6 @@
       <select id="config-select" class="config-select" hidden></select>
       <a href="#" class="change-client-link" id="change-client-link">change</a>
     </span>
-    <span class="privacy-pill">All processing stays in your browser</span>
   </div>
 
   <!-- Floating tab pill (sticky on scroll) -->

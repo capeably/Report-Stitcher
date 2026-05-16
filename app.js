@@ -2202,9 +2202,14 @@ function applyConfigToDom() {
 }
 
 // Client-code gate. Shown when CONFIG is null (no code in localStorage, or
-// the saved code doesn't match any registered config's clientCodes). Submit
-// path validates, saves to localStorage, and reloads — the resolver in
-// configs/index.js picks up the new code on the fresh page load.
+// the saved code doesn't match any registered config's clientCodes) AND when
+// the user clicks "change" from the app-strip. Submit path validates, saves
+// to localStorage, and reloads — the resolver in configs/index.js picks up
+// the new code on the fresh page load.
+//
+// Re-entrant safe: the submit handler is assigned via form.onsubmit (single
+// property) rather than addEventListener so re-invoking showClientGate from
+// the "change" link doesn't stack handlers.
 function showClientGate() {
   const dlg     = document.getElementById('client-gate-dialog');
   const form    = document.getElementById('client-gate-form');
@@ -2227,14 +2232,15 @@ function showClientGate() {
   }
 
   // Pre-fill with the saved code (if any) so the user sees what they had
-  // before — e.g. they're returning after the registry filter changed.
+  // before — e.g. they're returning after the registry filter changed, or
+  // they clicked "change" to swap clients.
   const existing = localStorage.getItem(window.CLIENT_KEY);
   if (existing) input.value = existing;
 
   errorEl.hidden = true;
   errorEl.textContent = '';
 
-  form.addEventListener('submit', (e) => {
+  form.onsubmit = (e) => {
     e.preventDefault();
     const code = input.value.trim().toLowerCase();
     if (!code) {
@@ -2252,11 +2258,11 @@ function showClientGate() {
     localStorage.setItem(window.CLIENT_KEY, code);
     localStorage.removeItem(window.CONFIG_KEY);   // reset to first available
     location.reload();
-  });
+  };
 
   if (typeof dlg.showModal === 'function') dlg.showModal();
   else dlg.setAttribute('open', '');
-  setTimeout(() => input.focus(), 0);
+  setTimeout(() => { input.focus(); input.select(); }, 0);
 }
 
 // Paint the app-strip's client display + config chooser + "change" link.
@@ -2291,11 +2297,15 @@ function wireClientStrip() {
     location.reload();
   });
 
+  // The "change" link opens the gate dialog in place rather than the old
+  // clear-storage-and-reload cycle. That cycle was a no-op while only one
+  // config is registered (the resolver in configs/index.js auto-fills the
+  // lone config's code on reload), so the user never actually saw the gate.
+  // Going through showClientGate() lets the user type a different code at
+  // any time, which matters during development with a single-config app.
   changeLink.addEventListener('click', (e) => {
     e.preventDefault();
-    localStorage.removeItem(window.CLIENT_KEY);
-    localStorage.removeItem(window.CONFIG_KEY);
-    location.reload();
+    showClientGate();
   });
 
   strip.hidden = false;

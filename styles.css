@@ -170,11 +170,15 @@ button.secondary {
    ============================================================ */
 
 .app-strip {
-  display: flex;
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
   align-items: center;
-  justify-content: space-between;
+  gap: 16px;
   margin: 4px 4px 18px;
 }
+.app-strip > :first-child  { justify-self: start;  }
+.app-strip > :nth-child(2) { justify-self: center; }
+.app-strip > :last-child   { justify-self: end;    }
 .wordmark {
   display: inline-flex;
   align-items: center;

@@ -58,8 +58,23 @@ window.getConfigsForClient = function(code) {
 // Active config: filtered by the current client code, then chosen by the
 // stored config id (falling back to the first match). Returns null if the
 // gate isn't satisfied — the engine treats null as "show client-code gate".
+//
+// Single-config short-circuit: when only one config is registered, auto-fill
+// its first clientCode into localStorage on the very first load so the gate
+// dialog doesn't show. Skips itself once a second config is registered —
+// from then on the gate becomes meaningful again and users need to pick a
+// code explicitly.
 window.getActiveStitchConfig = function() {
-  const available = window.getConfigsForClient(window.getClientCode());
+  let code = window.getClientCode();
+  if (!code && window.STITCH_CONFIGS.length === 1) {
+    const only = window.STITCH_CONFIGS[0];
+    const fallback = (Array.isArray(only.clientCodes) && only.clientCodes[0]) || null;
+    if (fallback) {
+      code = String(fallback).toLowerCase();
+      localStorage.setItem(window.CLIENT_KEY, code);
+    }
+  }
+  const available = window.getConfigsForClient(code);
   if (available.length === 0) return null;
   const storedId = localStorage.getItem(window.CONFIG_KEY);
   return available.find(c => c.id === storedId) || available[0];
