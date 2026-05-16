@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Report Stitcher — Campaign Member ↔ Participant</title>
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/nouislider@15.7.1/dist/nouislider.min.css">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<main>
+
+  <!-- Top strip: tiny wordmark + client/config chooser + privacy chip -->
+  <div class="app-strip">
+    <div class="wordmark">
+      <span class="logo-dot" aria-hidden="true"></span>
+      <span>Report Stitcher</span>
+    </div>
+    <span class="client-strip" id="client-strip" hidden>
+      <span class="client-strip-label">Client</span>
+      <strong id="client-code-display"></strong>
+      <span class="client-strip-sep" id="config-select-sep" hidden>·</span>
+      <label class="visually-hidden" for="config-select">Configuration</label>
+      <select id="config-select" class="config-select" hidden></select>
+      <a href="#" class="change-client-link" id="change-client-link">change</a>
+    </span>
+    <span class="privacy-pill">All processing stays in your browser</span>
+  </div>
+
+  <!-- Floating tab pill (sticky on scroll) -->
+  <div class="tab-strip-wrap">
+    <nav class="tab-strip" role="tablist" aria-label="Sections">
+      <a href="#configure" class="tab-link active" data-tab="configure" role="tab">
+        <svg class="tab-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 4h12M2 8h12M2 12h12"/></svg>
+        Configure &amp; Generate
+      </a>
+      <a href="#dashboard" class="tab-link disabled" data-tab="dashboard" id="tab-link-dashboard" role="tab" title="Upload and stitch reports first">
+        <svg class="tab-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 13V8M8 13V4M13 13v-3"/></svg>
+        Dashboard
+        <span class="tab-dot" aria-hidden="true"></span>
+      </a>
+    </nav>
+  </div>
+
+  <!-- ========== CONFIGURE TAB ========== -->
+  <div id="tab-configure" class="tab-content">
+
+    <!-- Hero intro card replaces the old dark header -->
+    <section class="intro-card" aria-label="Introduction">
+      <span class="intro-eyebrow">Salesforce report join</span>
+      <h1>Stitch <em>Campaign Members</em><br>to <em>Participants</em>.</h1>
+      <p class="intro-sub">Drop your two CSV exports, review the matches, then download a styled, multi-sheet xlsx with charts and a live dashboard.</p>
+    </section>
+
+    <!-- Step 1: Upload -->
+    <section class="step" id="step-upload">
+      <div class="step-head">
+        <span class="step-num">1</span>
+        <h2>Upload reports</h2>
+        <span class="step-blurb">Two CSVs from Salesforce</span>
+      </div>
+      <div id="upload-error" hidden></div>
+      <div class="drop-grid">
+        <label class="drop-zone" id="drop-primary" data-target="primary">
+          <span class="drop-illo primary" aria-hidden="true"></span>
+          <div class="drop-content">
+            <strong>Campaign Member CSV</strong>
+            <span class="drop-hint">Drag here or click to choose</span>
+            <input type="file" accept=".csv,text/csv" hidden>
+            <div class="file-status"></div>
+          </div>
+        </label>
+        <label class="drop-zone" id="drop-secondary" data-target="secondary">
+          <span class="drop-illo secondary" aria-hidden="true"></span>
+          <div class="drop-content">
+            <strong>Participant CSV</strong>
+            <span class="drop-hint">Drag here or click to choose</span>
+            <input type="file" accept=".csv,text/csv" hidden>
+            <div class="file-status"></div>
+          </div>
+        </label>
+      </div>
+      <div class="action-row">
+        <button id="btn-stitch" disabled>Stitch reports</button>
+        <small id="stitch-hint">Upload both reports to enable.</small>
+        <button class="secondary" id="btn-reset" hidden title="Clear cached files and reset the app">Reset</button>
+      </div>
+    </section>
+
+    <!-- Step 2: Stats / KPIs -->
+    <section class="step" id="step-stats" hidden>
+      <div class="step-head">
+        <span class="step-num">2</span>
+        <h2>Match summary</h2>
+        <span class="step-blurb">Funnel + match quality</span>
+      </div>
+
+      <p class="kpi-section-label" data-label="sectionPrimaryFunnel">Campaign Member funnel</p>
+      <div class="kpi-grid primary-funnel">
+        <div class="kpi"><span class="kpi-num" id="kpi-primary-total">0</span><span class="kpi-lbl" data-label="kpiPrimaryTotal">Total CMs</span></div>
+        <div class="kpi muted"><span class="kpi-num" id="kpi-primary-notconverted">0</span><span class="kpi-lbl" data-label="kpiStatusNotConverted">Not Converted</span></div>
+        <div class="kpi warn"><span class="kpi-num" id="kpi-primary-cancelled">0</span><span class="kpi-lbl" data-label="kpiStatusCancelled">Cancelled / Withdrawn / Etc</span></div>
+        <div class="kpi"><span class="kpi-num" id="kpi-primary-registered">0</span><span class="kpi-lbl" data-label="kpiStatusRegistered">Registered</span></div>
+        <div class="kpi success"><span class="kpi-num" id="kpi-primary-enrolled">0</span><span class="kpi-lbl" data-label="kpiStatusEnrolled">Enrolled</span></div>
+      </div>
+
+      <p class="kpi-section-label" data-label="sectionSecondaryMatching">Participant matching</p>
+      <div class="kpi-grid">
+        <div class="kpi"><span class="kpi-num" id="kpi-secondary-total">0</span><span class="kpi-lbl" data-label="kpiSecondaryTotal">Total PAs</span></div>
+        <div class="kpi success"><span class="kpi-num" id="kpi-stitched">0</span><span class="kpi-lbl" data-label="kpiStitched">Stitched (PA ↔ CM)</span></div>
+        <div class="kpi warn"><span class="kpi-num" id="kpi-secondary-unmatched">0</span><span class="kpi-lbl" data-label="kpiSecondaryUnmatched">PAs without CM</span></div>
+        <div class="kpi accent"><span class="kpi-num" id="kpi-conversion-rate">0%</span><span class="kpi-lbl" data-label="kpiConversionRate">CM conversion rate</span></div>
+      </div>
+
+      <div class="match-breakdown">
+        <span><span data-label="matchMethodLabel">Match method ContactID / Email / Phone:</span> <strong id="match-methods">0 / 0 / 0</strong></span>
+        <span><span data-label="scoreDistLabel">Course score 1.0 / fuzzy / 0.0:</span> <strong id="score-dist">0 / 0 / 0</strong></span>
+        <span><span data-label="testRemovedLabel">Test rows removed:</span> <strong id="test-removed">0</strong></span>
+      </div>
+
+      <a class="dashboard-callout" href="#dashboard" id="dashboard-callout">
+        <span class="callout-spark" aria-hidden="true">
+          <span></span><span></span><span></span><span></span>
+        </span>
+        <div class="callout-text">
+          <span class="callout-eyebrow">Your data is ready</span>
+          <h3 class="callout-title">Slice it on the Dashboard</h3>
+          <span class="callout-sub" data-label="calloutSub">Filter by date, parent campaign, sub-type, or status — and drill into any chart segment.</span>
+        </div>
+        <span class="callout-arrow" aria-hidden="true">→</span>
+      </a>
+    </section>
+
+    <!-- Step 3: Column picker -->
+    <section class="step" id="step-columns" hidden>
+      <div class="step-head">
+        <span class="step-num">3</span>
+        <h2>Configure columns</h2>
+        <span class="step-blurb">Defaults match the locked layout</span>
+      </div>
+      <small>Uncheck to exclude, drag with arrows to reorder, edit text to rename. Choices persist in your browser only.</small>
+      <div class="action-row compact">
+        <button class="secondary" id="btn-reset-cols">Reset to defaults</button>
+        <button class="secondary" id="btn-uncheck-cols">Uncheck all</button>
+        <button class="secondary" id="btn-check-cols">Check all</button>
+      </div>
+      <div class="column-list" id="column-list"></div>
+    </section>
+
+    <!-- Step 4: Preview -->
+    <section class="step" id="step-preview" hidden>
+      <div class="step-head">
+        <span class="step-num">4</span>
+        <h2>Stitched data preview</h2>
+        <span class="step-blurb">First 100 rows</span>
+      </div>
+      <div class="preview-meta" id="preview-meta"></div>
+      <div class="preview-table-wrap">
+        <table class="preview-table" id="preview-table"></table>
+      </div>
+    </section>
+
+    <!-- Step 5: Download -->
+    <section class="step" id="step-download" hidden>
+      <div class="step-head">
+        <span class="step-num">5</span>
+        <h2>Download xlsx</h2>
+        <span class="step-blurb">Styled, multi-sheet, with charts</span>
+      </div>
+      <small>Generates a styled, multi-sheet xlsx doc downloaded to your computer.</small>
+      <div class="action-row">
+        <button id="btn-xlsx" class="primary-amber">Generate xlsx</button>
+        <span id="xlsx-status"></span>
+      </div>
+    </section>
+
+  </div>
+
+  <!-- ========== DASHBOARD TAB ========== -->
+  <div id="tab-dashboard" class="tab-content" hidden>
+
+    <section class="filter-bar" id="filter-bar">
+      <div class="filter-row">
+        <div class="filter-date">
+          <label>Date range</label>
+          <div id="date-slider"></div>
+          <div class="filter-meta">
+            <span class="filter-date-inputs">
+              <input type="date" id="filter-date-min" class="date-input" aria-label="Start date">
+              <span>to</span>
+              <input type="date" id="filter-date-max" class="date-input" aria-label="End date">
+            </span>
+            <button class="filter-mode-toggle" id="filter-date-mode" type="button" data-label-title="dateModeToggleTitle" title="Toggle between Activity date (CM update / PA created) and Course start date">
+              Date axis: <strong id="filter-date-label">Activity</strong> ⇅
+            </button>
+          </div>
+        </div>
+      </div>
+      <div class="filter-row">
+        <div class="filter-multi">
+          <label data-label="filterParentLabel">Parent Campaign</label>
+          <button id="filter-parent-toggle" class="filter-multi-toggle" type="button">All campaigns ▾</button>
+          <div id="filter-parent-dropdown" class="filter-multi-dropdown" hidden></div>
+        </div>
+        <div class="filter-multi">
+          <label data-label="filterSubTypeLabel">Sub-Type</label>
+          <button id="filter-subtype-toggle" class="filter-multi-toggle" type="button">All sub-types ▾</button>
+          <div id="filter-subtype-dropdown" class="filter-multi-dropdown" hidden></div>
+        </div>
+        <div class="filter-chips">
+          <label data-label="filterBucketLabel">Sub-Type Bucket</label>
+          <div class="chip-group" id="filter-bucket-chips"></div>
+        </div>
+        <div class="filter-chips">
+          <label data-label="filterStatusLabel">Course Status</label>
+          <div class="chip-group" id="filter-status-chips"></div>
+        </div>
+        <button class="secondary" id="btn-filter-reset" type="button">Reset filters</button>
+      </div>
+      <div class="filter-summary-row">
+        <div class="filter-summary" id="filter-summary"></div>
+        <div class="filter-actions">
+          <button id="btn-filtered-xlsx" class="primary-amber" type="button" data-label="btnFilteredXlsxLabel">Generate xlsx (current filter)</button>
+          <span id="filtered-xlsx-status"></span>
+        </div>
+      </div>
+    </section>
+
+    <p class="kpi-section-label" data-label="sectionDashboardFunnel">Filtered Campaign Member funnel</p>
+    <div class="kpi-grid primary-funnel" style="margin-bottom:18px;">
+      <div class="kpi"><span class="kpi-num" id="dash-kpi-total">0</span><span class="kpi-lbl" data-label="kpiDashPrimaryTotal">CMs (filtered)</span></div>
+      <div class="kpi muted"><span class="kpi-num" id="dash-kpi-notconverted">0</span><span class="kpi-lbl" data-label="kpiStatusNotConverted">Not Converted</span></div>
+      <div class="kpi warn"><span class="kpi-num" id="dash-kpi-cancelled">0</span><span class="kpi-lbl" data-label="kpiStatusCancelled">Cancelled / Withdrawn / Etc</span></div>
+      <div class="kpi"><span class="kpi-num" id="dash-kpi-registered">0</span><span class="kpi-lbl" data-label="kpiStatusRegistered">Registered</span></div>
+      <div class="kpi success"><span class="kpi-num" id="dash-kpi-enrolled">0</span><span class="kpi-lbl" data-label="kpiStatusEnrolled">Enrolled</span></div>
+    </div>
+
+    <div class="dash-chart-grid">
+      <div class="dash-chart-card">
+        <h3>Conversion funnel</h3>
+        <small class="chart-caption" id="chart-funnel-caption" data-label="chartFunnelCaption">Click any segment to drill into the matching Campaign Members.</small>
+        <div class="chart-canvas-wrap chart-funnel-wrap">
+          <canvas id="chart-funnel" aria-label="Conversion funnel chart"></canvas>
+        </div>
+      </div>
+      <div class="dash-chart-card">
+        <h3>Acquisition vs. conversion over time</h3>
+        <small class="chart-caption" id="chart-timeseries-caption" data-label="chartTimeseriesCaption">Click any point to drill into the Campaign Members or Participants in that time bin.</small>
+        <div class="chart-canvas-wrap chart-timeseries-wrap">
+          <canvas id="chart-timeseries" aria-label="Acquisition vs conversion time series"></canvas>
+        </div>
+      </div>
+    </div>
+
+    <p class="kpi-section-label" style="margin-top:18px;" data-label="sectionDistributions">Distributions (Registered + Enrolled)</p>
+    <div class="dash-chart-grid">
+      <div class="dash-chart-card">
+        <h3 data-label="chartSubtypeTitle">Registrations by Sub-Type</h3>
+        <small class="chart-caption">Detail rows only (bucket parents excluded). Reflects active filters.</small>
+        <div class="chart-canvas-wrap"><canvas id="chart-subtype" aria-label="Sub-Type chart"></canvas></div>
+      </div>
+      <div class="dash-chart-card">
+        <h3 data-label="chartParentTitle">Registrations by Parent Campaign</h3>
+        <small class="chart-caption">Reflects active filters.</small>
+        <div class="chart-canvas-wrap"><canvas id="chart-parent" aria-label="Parent campaign chart"></canvas></div>
+      </div>
+      <div class="dash-chart-card">
+        <h3 data-label="chartCourseTitle">Registrations by Course</h3>
+        <small class="chart-caption">Reflects active filters.</small>
+        <div class="chart-canvas-wrap"><canvas id="chart-course" aria-label="Course chart"></canvas></div>
+      </div>
+    </div>
+
+    <p class="kpi-section-label" style="margin-top:18px;" data-label="sectionCampaignSummary">Campaign Summary</p>
+    <div class="dash-chart-card">
+      <small class="chart-caption">Same structure as the xlsx Campaign Summary tab. Counts respond to the active filters.</small>
+      <div class="campaign-summary-table-wrap">
+        <table class="campaign-summary-table" id="campaign-summary-table"></table>
+      </div>
+    </div>
+
+  </div>
+
+</main>
+
+<dialog class="client-gate" id="client-gate-dialog" aria-labelledby="client-gate-title">
+  <header>
+    <h3 id="client-gate-title">Enter your client code</h3>
+  </header>
+  <form id="client-gate-form" method="dialog" class="client-gate-form">
+    <p class="client-gate-help">A client code unlocks the report configurations available to you. The codebase is public — the code scopes which configs you see, it isn't authentication.</p>
+    <input type="text" id="client-gate-input" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" required>
+    <div class="client-gate-error" id="client-gate-error" hidden></div>
+    <div class="action-row">
+      <button type="submit" class="primary">Continue</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog class="drilldown" id="drilldown-dialog" aria-labelledby="drilldown-title">
+  <header>
+    <h3 id="drilldown-title">Records</h3>
+    <button class="dialog-close" id="drilldown-close" type="button" aria-label="Close">×</button>
+  </header>
+  <div class="drilldown-meta" id="drilldown-meta"></div>
+  <div class="drilldown-table-wrap">
+    <table class="drilldown-table" id="drilldown-table"></table>
+  </div>
+  <div class="drilldown-pager">
+    <button id="drilldown-prev" type="button">‹ Prev</button>
+    <span class="drilldown-pager-meta" id="drilldown-pager-meta"></span>
+    <button id="drilldown-next" type="button">Next ›</button>
+  </div>
+</dialog>
+
+<footer>
+  <span class="privacy-note">All processing happens in your browser.</span>
+  No data leaves this page — files cache locally on this device until you Reset.
+</footer>
+
+<div id="offscreen-charts">
+  <canvas id="off-subtype" width="1400" height="700"></canvas>
+  <canvas id="off-parent"  width="1400" height="900"></canvas>
+  <canvas id="off-course"  width="1400" height="1100"></canvas>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<!-- Vendor scripts -->
+<script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/exceljs@4.4.0/dist/exceljs.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/file-saver@2.0.5/dist/FileSaver.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/nouislider@15.7.1/dist/nouislider.min.js"></script>
+
+<!-- Config registry + built-in configs (must load before app.js) -->
+<script src="configs/index.js"></script>
+<script src="configs/emory-cm-pa.js"></script>
+
+<!-- App + tweaks -->
+<script src="app.js"></script>
+<script src="tweaks.js"></script>
+
+</body>
+</html>
