@@ -48,8 +48,15 @@ const STATE = {
   secondary: { rows: null, fileName: null },
   stitched:  null,    // [{ primary, secondary, method, score, subtypeBucket }]
   unmatched: null,    // [secondary rows]
+  // Candidate matches rejected by CONFIG.matchValidator — kept around so the
+  // config can surface them on a separate sheet for investigation rather than
+  // silently dropping them.
+  rejectedMatches: null, // [{ primary, secondary, method, reason }]
   methodCounts: null, // keyed by CONFIG.matchStrategy[i].method
   testRemovedCount: 0,
+  // The actual rows CONFIG.testRowFilter pulled out — surfaced under Match
+  // Summary so the user can validate the filter's calls.
+  testRemovedRows: { primary: [], secondary: [] },
   columns: null,      // [ { ...DEFAULT col, enabled: bool } ]
 };
 
@@ -283,33 +290,80 @@ function findMatches(secondaryRow, indexes, matchStrategy) {
 }
 
 function stitch(primaryRows, secondaryRows) {
-  const primaryClean   = primaryRows.filter(r => !CONFIG.testRowFilter(r));
-  const secondaryClean = secondaryRows.filter(r => !CONFIG.testRowFilter(r));
-  const testRemovedCount = (primaryRows.length - primaryClean.length)
-                         + (secondaryRows.length - secondaryClean.length);
+  // Split each side into kept rows + filtered-out test rows. The test rows
+  // surface in Match Summary so the user can spot misclassifications.
+  const primaryClean = [], primaryTest = [];
+  for (const r of primaryRows) (CONFIG.testRowFilter(r) ? primaryTest : primaryClean).push(r);
+  const secondaryClean = [], secondaryTest = [];
+  for (const r of secondaryRows) (CONFIG.testRowFilter(r) ? secondaryTest : secondaryClean).push(r);
+  const testRemovedCount = primaryTest.length + secondaryTest.length;
+  const testRemovedRows  = { primary: primaryTest, secondary: secondaryTest };
 
   const matchStrategy = CONFIG.matchStrategy;
   const primaryIdx    = indexPrimary(primaryClean, matchStrategy);
-  const stitched      = [];
-  const unmatched     = [];
-  const methodCounts  = {};
+
+  // Optional validator: returns true (or a truthy value) if a candidate
+  // (primary, secondary) pair makes logical sense. Reject reasons surface in
+  // rejectedMatches (string or true → no reason). When a secondary has at
+  // least one valid candidate, that valid set goes to tiebreaker as usual;
+  // when ALL its candidates are rejected, the secondary moves to `unmatched`
+  // and each rejected candidate is recorded for the config to surface (e.g.
+  // a separate xlsx sheet for investigation).
+  const validator = (typeof CONFIG.matchValidator === 'function') ? CONFIG.matchValidator : null;
+
+  const stitched        = [];
+  const unmatched       = [];
+  const rejectedMatches = [];
+  const methodCounts    = {};
   for (const rule of matchStrategy) methodCounts[rule.method] = 0;
 
   for (const secondary of secondaryClean) {
     const match = findMatches(secondary, primaryIdx, matchStrategy);
     if (!match) { unmatched.push(secondary); continue; }
-    const { row: primary, score } = CONFIG.tiebreaker(match.candidates, secondary);
-    methodCounts[match.method]++;
-    const matchInfo = { method: match.method, score };
-    stitched.push({
-      primary, secondary,
-      method: match.method,
-      score: Math.round(score * 1000) / 1000,
-      subtypeBucket: CONFIG.derivedFields.subtype_bucket(primary, secondary, matchInfo),
-    });
+
+    let validCandidates = match.candidates;
+    let rejected = [];
+    if (validator) {
+      validCandidates = [];
+      for (const cand of match.candidates) {
+        const verdict = validator(cand, secondary, { method: match.method });
+        if (verdict === true || (verdict && verdict.valid !== false)) {
+          validCandidates.push(cand);
+        } else {
+          rejected.push({
+            cand,
+            reason: (verdict && typeof verdict === 'object' && verdict.reason) || null,
+          });
+        }
+      }
+    }
+
+    if (validCandidates.length > 0) {
+      const { row: primary, score } = CONFIG.tiebreaker(validCandidates, secondary);
+      methodCounts[match.method]++;
+      const matchInfo = { method: match.method, score };
+      stitched.push({
+        primary, secondary,
+        method: match.method,
+        score: Math.round(score * 1000) / 1000,
+        subtypeBucket: CONFIG.derivedFields.subtype_bucket(primary, secondary, matchInfo),
+      });
+    } else {
+      // No valid candidate — treat secondary as unmatched and log every
+      // rejected candidate so the config can surface them.
+      unmatched.push(secondary);
+      for (const r of rejected) {
+        rejectedMatches.push({
+          primary:   r.cand,
+          secondary,
+          method:    match.method,
+          reason:    r.reason,
+        });
+      }
+    }
   }
 
-  return { stitched, unmatched, methodCounts, testRemovedCount };
+  return { stitched, unmatched, methodCounts, testRemovedCount, testRemovedRows, rejectedMatches };
 }
 
 /* ============================================================
@@ -329,9 +383,19 @@ function getCellValue(row, col) {
     return v == null ? '' : v;
   }
   if (col.source === 'derived') {
+    // Fast paths for fields the engine pre-computes during stitch (cached on
+    // the stitched row directly so we don't re-invoke the config function for
+    // every cell render):
     if (col.sourceField === 'subtype_bucket') return subtypeBucket;
     if (col.sourceField === 'match_method')   return method;
     if (col.sourceField === 'course_score')   return score;
+    // Anything else: invoke the config's derivedField on demand. Returns
+    // null/undefined → empty string in the cell.
+    const fn = CONFIG && CONFIG.derivedFields && CONFIG.derivedFields[col.sourceField];
+    if (typeof fn === 'function') {
+      const v = fn(primary, secondary, { method, score });
+      return v == null ? '' : v;
+    }
   }
   return '';
 }
@@ -520,17 +584,22 @@ function renderPreviewTable() {
 }
 
 function renderKpis() {
-  // Primary-input funnel — headline metrics. Each primary row (post test-row
-  // removal) lands in exactly one CourseStatus bucket via the same derivation
-  // the Campaign Members xlsx sheet uses.
-  const primaryClean = STATE.primary.rows.filter(r => !CONFIG.testRowFilter(r));
+  // Primary-input funnel — headline metrics. Scope: primary rows whose date
+  // dimension (CM Update Date for Emory) falls in FILTERS.focus. This matches
+  // the Campaign Summary xlsx tab's framing — both reflect Focus-period
+  // campaign activity. The match-info comes from STATE.stitched, which has
+  // already been bounded to PA ∈ Focus × CM ∈ Influence.
+  const dateOf = CONFIG.dashboard && CONFIG.dashboard.dateOf;
+  const primaryInFocus = STATE.primary.rows.filter(r =>
+    !CONFIG.testRowFilter(r) && (!dateOf || dateInRange(dateOf.primary(r), FILTERS.focus))
+  );
   const primaryToStitched = new Map();
   for (const s of STATE.stitched) {
     if (!primaryToStitched.has(s.primary)) primaryToStitched.set(s.primary, []);
     primaryToStitched.get(s.primary).push(s);
   }
   let countNc = 0, countCx = 0, countRg = 0, countEn = 0;
-  for (const primary of primaryClean) {
+  for (const primary of primaryInFocus) {
     const status = CONFIG.deriveCourseStatus(primaryToStitched.get(primary) || []);
     if (status === 'Not Converted')                 countNc++;
     else if (status === 'Cancelled/Withdrawn/Etc')  countCx++;
@@ -538,9 +607,9 @@ function renderKpis() {
     else if (status === 'Enrolled')                 countEn++;
   }
   const converted = countRg + countEn;
-  const conversionRate = primaryClean.length === 0 ? 0 : (converted / primaryClean.length) * 100;
+  const conversionRate = primaryInFocus.length === 0 ? 0 : (converted / primaryInFocus.length) * 100;
 
-  document.getElementById('kpi-primary-total').textContent        = primaryClean.length.toLocaleString();
+  document.getElementById('kpi-primary-total').textContent        = primaryInFocus.length.toLocaleString();
   document.getElementById('kpi-primary-notconverted').textContent = countNc.toLocaleString();
   document.getElementById('kpi-primary-cancelled').textContent    = countCx.toLocaleString();
   document.getElementById('kpi-primary-registered').textContent   = countRg.toLocaleString();
@@ -548,7 +617,9 @@ function renderKpis() {
   document.getElementById('kpi-conversion-rate').textContent =
     conversionRate < 10 ? conversionRate.toFixed(1) + '%' : Math.round(conversionRate) + '%';
 
-  // Secondary-input matching — secondary metrics
+  // Secondary-input matching — secondary metrics. STATE.stitched and
+  // STATE.unmatched are already Focus-bounded by runStitch, so these counts
+  // reflect PAs ∈ Focus.
   const stitched = STATE.stitched.length;
   const unmatchedSecondary = STATE.unmatched.length;
   document.getElementById('kpi-secondary-total').textContent     = (stitched + unmatchedSecondary).toLocaleString();
@@ -566,6 +637,46 @@ function renderKpis() {
   }
   document.getElementById('score-dist').textContent   = `${s1} / ${sFuzzy} / ${s0}`;
   document.getElementById('test-removed').textContent = STATE.testRemovedCount.toLocaleString();
+  renderTestRowsRemoved();
+}
+
+// List the rows CONFIG.testRowFilter pulled out, grouped by source side, so
+// the user can validate the filter's calls. Container hides when count is 0;
+// each side's column hides when that side contributed nothing.
+function renderTestRowsRemoved() {
+  const container = document.getElementById('test-rows-removed');
+  if (!container) return;
+
+  const removed = STATE.testRemovedRows || { primary: [], secondary: [] };
+  if (removed.primary.length + removed.secondary.length === 0) {
+    container.hidden = true;
+    return;
+  }
+  container.hidden = false;
+
+  const renderItem = (r) => {
+    const first = ((r['First Name'] || '') + '').trim();
+    const last  = ((r['Last Name']  || '') + '').trim();
+    const email = ((r['Email']      || '') + '').trim();
+    const name  = [first, last].filter(Boolean).join(' ') || '(no name)';
+    const emailHtml = email ? ` · <span class="test-row-email">${escapeHtml(email)}</span>` : '';
+    return `<li><span class="test-row-name">${escapeHtml(name)}</span>${emailHtml}</li>`;
+  };
+
+  const fillSide = (kind, rows) => {
+    const col      = document.getElementById(`test-rows-${kind}-col`);
+    const list     = document.getElementById(`test-rows-${kind}-list`);
+    const heading  = col.querySelector('.test-rows-source-heading');
+    if (!col || !list || !heading) return;
+    if (rows.length === 0) { col.hidden = true; list.innerHTML = ''; return; }
+    const inputLabel = (CONFIG.inputs && CONFIG.inputs[kind] && CONFIG.inputs[kind].label) || kind;
+    heading.textContent = `${inputLabel} (${rows.length.toLocaleString()})`;
+    list.innerHTML = rows.map(renderItem).join('');
+    col.hidden = false;
+  };
+
+  fillSide('primary',   removed.primary);
+  fillSide('secondary', removed.secondary);
 }
 
 /* ============================================================
@@ -933,7 +1044,7 @@ window.RS = {
   BORDER_THIN, BORDER_MED_BOTTOM, BORDER_MED_TOP,
   NAVY_ARGB, WHITE_ARGB, LIGHT_BLUE_ARGB, GRAY_FILL_ARGB, RED_TITLE_ARGB,
   colLetter, letterToCol, applyBorderRange, escapeFormula, findEnabledColIndex,
-  getCellValue, aggregateAll,
+  getCellValue, aggregateAll, dateInRange, parseSfDate,
   renderChartPng: renderOffscreenChartPng,
 };
 
@@ -953,7 +1064,16 @@ async function generateXlsx(opts = {}) {
   wb.creator = 'Report Stitcher';
   wb.created = new Date();
 
-  const ctx = { sheets: {} };
+  // Snapshot active Focus + Influence windows for the builders. We pass the
+  // refs (mutable) rather than copying so a builder can apply tightening
+  // logic without re-reading globals. dateOf hooks travel along so builders
+  // don't need to know the row-cache field names.
+  const ctx = {
+    sheets:    {},
+    focus:     FILTERS.focus,
+    influence: FILTERS.influence,
+    dateOf:    CONFIG.dashboard && CONFIG.dashboard.dateOf,
+  };
   for (const sheet of CONFIG.outputSheets) {
     const result = await sheet.builder(wb, ctx);
     if (result) ctx.sheets[sheet.name] = result;
@@ -1018,14 +1138,18 @@ const PALETTE = {
 const MONTH_ABBR = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 const ONE_DAY = 86400000;
 
+// Two date windows scope the stitch (see runStitch):
+//   Focus     — Participant Created Date range; bounds the secondary input.
+//   Influence — Campaign Member Updated Date range; bounds the primary input
+//               (typically wider than Focus to capture earlier campaign touches).
+// The other filters (parent, sub-type, status) apply at render time only.
 const FILTERS = {
-  dateMin: null,           // Date or null
-  dateMax: null,
-  dateMode: 'activity',    // 'activity' | 'courseStart'
+  focus:           { dateMin: null, dateMax: null },
+  influence:       { dateMin: null, dateMax: null },
   parentCampaigns: null,   // null = all, else Set<string>
-  subTypes: null,          // null = all, else Set<string> (raw Sub-Type values)
-  subTypeBuckets: null,    // null = all (= empty selection), else Set<string>
-  courseStatuses: null,    // null = all, else Set<string>
+  subTypes:        null,
+  subTypeBuckets:  null,
+  courseStatuses:  null,
 };
 const DASH = {
   initialized:    false,
@@ -1034,8 +1158,10 @@ const DASH = {
   parentSelected: null,    // Set<string>
   subTypeList:    [],
   subTypeSelected: null,   // Set<string>
-  dateMinAvail:   null,    // Date
-  dateMaxAvail:   null,
+  // Available bounds (from raw data) — set at first stitch, used to clamp
+  // the sliders. *Default is the auto-fill value used by Reset Filters.
+  focusMinAvail:      null, focusMaxAvail:      null, focusDefault:      null,
+  influenceMinAvail:  null, influenceMaxAvail:  null, influenceDefault:  null,
   funnelChart:    null,
   timeseriesChart:null,
   drillRows:      [],
@@ -1089,6 +1215,29 @@ function startOfWeek(d) {
 }
 function startOfMonth(d) {
   return new Date(d.getFullYear(), d.getMonth(), 1);
+}
+function endOfMonth(d) {
+  // Last calendar day of the month at start-of-day. Day 0 of next month = last day of this month.
+  return new Date(d.getFullYear(), d.getMonth() + 1, 0);
+}
+
+// Range-check helper. `range` is { dateMin, dateMax } (both optional). A null
+// date never matches; the bound is inclusive on both sides at start-of-day.
+function dateInRange(date, range) {
+  if (!date || !range) return false;
+  if (range.dateMin && date < range.dateMin) return false;
+  if (range.dateMax && date > new Date(range.dateMax.getTime() + 86400000 - 1)) return false;
+  return true;
+}
+
+// Wipe the Focus + Influence windows so autoFillDateRanges re-seeds them
+// from data on the next stitch. Called after a fresh upload / remove / Reset
+// — the previous window may no longer make sense with new data.
+function clearActiveDateFilters() {
+  FILTERS.focus.dateMin     = null;
+  FILTERS.focus.dateMax     = null;
+  FILTERS.influence.dateMin = null;
+  FILTERS.influence.dateMax = null;
 }
 
 function cacheParsedDatesOnRows() {
@@ -1144,14 +1293,11 @@ function buildPrimaryDataset() {
 }
 
 function applyDashboardFilters(dataset) {
-  const { dateMin, dateMax, dateMode, parentCampaigns, subTypes, subTypeBuckets, courseStatuses } = FILTERS;
+  // Date filtering is no longer needed here — runStitch bounds the inputs
+  // by FILTERS.focus / FILTERS.influence at stitch time, so DASH.primaryDataset
+  // (built from STATE.stitched) is already date-scoped.
+  const { parentCampaigns, subTypes, subTypeBuckets, courseStatuses } = FILTERS;
   return dataset.filter(d => {
-    const dateVal = dateMode === 'courseStart' ? d.courseStart : d.primaryActivity;
-    // Rows lacking a date in the active mode are excluded when a range is set —
-    // they have no place on a time-axis view.
-    if ((dateMin || dateMax) && !dateVal) return false;
-    if (dateMin && dateVal < dateMin) return false;
-    if (dateMax && dateVal > new Date(dateMax.getTime() + ONE_DAY - 1)) return false;
     if (parentCampaigns && !parentCampaigns.has(d.parentCampaign)) return false;
     if (subTypes        && !subTypes.has(d.subType)) return false;
     if (subTypeBuckets  && !subTypeBuckets.has(d.subTypeBucket)) return false;
@@ -1179,15 +1325,10 @@ function setActiveTab(name) {
   // "Slice it on the Dashboard" callout near the bottom of Step 2). Reset.
   window.scrollTo({ top: 0, behavior: 'smooth' });
   if (name === 'dashboard') {
-    // The slider + charts were created while the panel was display:none, so
-    // their pixel-based layout may be wrong. Force a resize after layout has
-    // settled so handles land where the values say they should.
+    // Charts were created while the panel was display:none, so canvas
+    // dimensions may be stale. Fire resize after layout settles so Chart.js
+    // recomputes widths.
     requestAnimationFrame(() => {
-      const sliderEl = document.getElementById('date-slider');
-      if (sliderEl && sliderEl.noUiSlider) {
-        const vals = sliderEl.noUiSlider.get();
-        sliderEl.noUiSlider.set(vals);
-      }
       window.dispatchEvent(new Event('resize'));
       refreshDashboard();
     });
@@ -1209,85 +1350,124 @@ function enableDashboardTab(showCue = true) {
 
 /* --- Filter UI ---------------------------------------------------------- */
 
+// Re-stitch with current Focus/Influence windows (which the date controls
+// have just mutated in place on FILTERS.focus / FILTERS.influence). Skips
+// the "fresh data" cue and scroll-into-view since this is a refinement of
+// an existing result, not a brand-new stitch.
+function onDateRangeChange() {
+  runStitch({ fromCache: true, skipScroll: true });
+}
+
+// Helpers used by both the Configure-tab Date Ranges step and the
+// Dashboard's filter-bar date inputs.
+function _dateToIsoInput(d) {
+  if (!d) return '';
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+// Wire a single date input against a mutable FILTERS.*.{dateMin|dateMax}.
+// Clamps to [availMin, availMax] and to the other end of the range, then
+// fires onChange (which typically re-stitches).
+function wireDateInput(inputId, availMin, availMax, range, kind, onChange) {
+  const inp = document.getElementById(inputId);
+  if (!inp) return;
+  inp.min = _dateToIsoInput(availMin);
+  inp.max = _dateToIsoInput(availMax);
+  inp.value = _dateToIsoInput(kind === 'min' ? range.dateMin : range.dateMax);
+  inp.onchange = () => {
+    if (!inp.value) return;
+    const parsed = startOfDay(new Date(inp.value + 'T00:00:00'));
+    if (isNaN(parsed.getTime())) return;
+    const lo = availMin.getTime(), hi = availMax.getTime();
+    const ts = Math.max(lo, Math.min(hi, parsed.getTime()));
+    const next = startOfDay(new Date(ts));
+    if (kind === 'min') {
+      range.dateMin = (range.dateMax && next > range.dateMax) ? range.dateMax : next;
+    } else {
+      range.dateMax = (range.dateMin && next < range.dateMin) ? range.dateMin : next;
+    }
+    inp.value = _dateToIsoInput(range[kind === 'min' ? 'dateMin' : 'dateMax']);
+    onChange();
+  };
+}
+
+// Wire the (min, max) pair for one date range. Used twice in initDashboard
+// (Focus + Influence) and reused by renderDateRangesStep for the Configure
+// tab inputs.
+function wireDateRangeControls(opts) {
+  const { minInputId, maxInputId, availMin, availMax, filterRange, onChange } = opts;
+  wireDateInput(minInputId, availMin, availMax, filterRange, 'min', onChange);
+  wireDateInput(maxInputId, availMin, availMax, filterRange, 'max', onChange);
+}
+
+// Configure-tab Date Ranges step — same control surface as the dashboard's
+// filter-bar pair, just on the static Configure flow before xlsx generation.
+function renderDateRangesStep() {
+  if (!CONFIG.dashboard || !CONFIG.dashboard.dateOf) return;
+
+  wireDateRangeControls({
+    minInputId: 'cfg-focus-min',     maxInputId: 'cfg-focus-max',
+    availMin:   DASH.focusMinAvail,  availMax:   DASH.focusMaxAvail,
+    filterRange: FILTERS.focus,      onChange:   onDateRangeChange,
+  });
+  wireDateRangeControls({
+    minInputId: 'cfg-influence-min', maxInputId: 'cfg-influence-max',
+    availMin:   DASH.influenceMinAvail, availMax: DASH.influenceMaxAvail,
+    filterRange: FILTERS.influence,  onChange:   onDateRangeChange,
+  });
+
+  const btn = document.getElementById('btn-dates-reset');
+  if (btn) {
+    btn.onclick = () => {
+      if (DASH.focusDefault) {
+        FILTERS.focus.dateMin = DASH.focusDefault.dateMin;
+        FILTERS.focus.dateMax = DASH.focusDefault.dateMax;
+      }
+      if (DASH.influenceDefault) {
+        FILTERS.influence.dateMin = DASH.influenceDefault.dateMin;
+        FILTERS.influence.dateMax = DASH.influenceDefault.dateMax;
+      }
+      onDateRangeChange();
+    };
+  }
+}
+
 function initDashboard(opts = {}) {
-  cacheParsedDatesOnRows();
+  // Date caches + Focus/Influence windows are already set by runStitch (which
+  // gated everything in this function). Build the per-CM dashboard dataset
+  // from the date-bounded STATE.stitched.
   DASH.primaryDataset = buildPrimaryDataset();
 
-  // Compute slider domain — union of CM update dates and PA created dates
-  const allDates = [];
-  for (const d of DASH.primaryDataset) {
-    if (d.primaryActivity)    allDates.push(d.primaryActivity.getTime());
-    if (d.secondaryCreated)   allDates.push(d.secondaryCreated.getTime());
-    if (d.courseStart) allDates.push(d.courseStart.getTime());
-  }
-  const minTs = allDates.length ? Math.min(...allDates) : Date.now();
-  const maxTs = allDates.length ? Math.max(...allDates) : Date.now();
-  DASH.dateMinAvail = startOfDay(new Date(minTs));
-  DASH.dateMaxAvail = startOfDay(new Date(maxTs));
-
-  // Initial filter state — all on except Not Converted (per consultant pitfall §5.3)
-  FILTERS.dateMin         = DASH.dateMinAvail;
-  FILTERS.dateMax         = DASH.dateMaxAvail;
-  FILTERS.dateMode        = 'activity';
+  // Initial filter state for non-date filters. Note: date ranges are owned
+  // by runStitch (FILTERS.focus / FILTERS.influence). All on except Not
+  // Converted (per consultant pitfall §5.3).
   FILTERS.parentCampaigns = null;
   FILTERS.subTypes        = null;
   FILTERS.subTypeBuckets  = new Set(CONFIG.dashboard.bucketOptions);
   FILTERS.courseStatuses  = new Set(['Cancelled/Withdrawn/Etc', 'Registered', 'Enrolled']);
 
-  // Date slider
-  const sliderEl = document.getElementById('date-slider');
-  if (sliderEl.noUiSlider) sliderEl.noUiSlider.destroy();
-  if (DASH.dateMinAvail.getTime() === DASH.dateMaxAvail.getTime()) {
-    // Degenerate single-day dataset — pad by 1 day so the slider can render
-    DASH.dateMaxAvail = new Date(DASH.dateMinAvail.getTime() + ONE_DAY);
-    FILTERS.dateMax = DASH.dateMaxAvail;
-  }
-  noUiSlider.create(sliderEl, {
-    start:   [DASH.dateMinAvail.getTime(), DASH.dateMaxAvail.getTime()],
-    connect: true,
-    range:   { min: DASH.dateMinAvail.getTime(), max: DASH.dateMaxAvail.getTime() },
-    step:    ONE_DAY,
-    tooltips: [
-      { to: ts => fmtDate(new Date(+ts)) },
-      { to: ts => fmtDate(new Date(+ts)) },
-    ],
+  // Both date ranges wired through the same helper. Range changes trigger
+  // re-stitch (Focus bounds secondary, Influence bounds primary), which in
+  // turn re-renders the whole pipeline (KPIs, dashboard, etc).
+  wireDateRangeControls({
+    minInputId: 'filter-focus-min',
+    maxInputId: 'filter-focus-max',
+    availMin:   DASH.focusMinAvail,
+    availMax:   DASH.focusMaxAvail,
+    filterRange: FILTERS.focus,
+    onChange:   onDateRangeChange,
   });
-  const dateMinInput = document.getElementById('filter-date-min');
-  const dateMaxInput = document.getElementById('filter-date-max');
-  // Set the bounds so users can't pick outside the dataset's available range.
-  const _toIso = (d) => {
-    const y = d.getFullYear();
-    const m = String(d.getMonth() + 1).padStart(2, '0');
-    const day = String(d.getDate()).padStart(2, '0');
-    return `${y}-${m}-${day}`;
-  };
-  dateMinInput.min = dateMaxInput.min = _toIso(DASH.dateMinAvail);
-  dateMinInput.max = dateMaxInput.max = _toIso(DASH.dateMaxAvail);
-
-  sliderEl.noUiSlider.on('update', (values) => {
-    FILTERS.dateMin = startOfDay(new Date(+values[0]));
-    FILTERS.dateMax = startOfDay(new Date(+values[1]));
-    // Keep the date inputs in sync with the slider unless the user is actively editing
-    if (document.activeElement !== dateMinInput) dateMinInput.value = _toIso(FILTERS.dateMin);
-    if (document.activeElement !== dateMaxInput) dateMaxInput.value = _toIso(FILTERS.dateMax);
+  wireDateRangeControls({
+    minInputId: 'filter-influence-min',
+    maxInputId: 'filter-influence-max',
+    availMin:   DASH.influenceMinAvail,
+    availMax:   DASH.influenceMaxAvail,
+    filterRange: FILTERS.influence,
+    onChange:   onDateRangeChange,
   });
-  sliderEl.noUiSlider.on('change', refreshDashboard);
-
-  // Editable date inputs feed the slider — clamp + swap if the user inverts the range.
-  const _onDateInput = (which) => {
-    const v = which === 'min' ? dateMinInput.value : dateMaxInput.value;
-    if (!v) return;
-    const parsed = startOfDay(new Date(v + 'T00:00:00'));
-    if (isNaN(parsed.getTime())) return;
-    let lo = FILTERS.dateMin.getTime();
-    let hi = FILTERS.dateMax.getTime();
-    if (which === 'min') lo = Math.max(DASH.dateMinAvail.getTime(), Math.min(parsed.getTime(), hi));
-    else                 hi = Math.min(DASH.dateMaxAvail.getTime(), Math.max(parsed.getTime(), lo));
-    sliderEl.noUiSlider.set([lo, hi]);
-    refreshDashboard();
-  };
-  dateMinInput.addEventListener('change', () => _onDateInput('min'));
-  dateMaxInput.addEventListener('change', () => _onDateInput('max'));
 
   // Parent campaign multi-select
   DASH.parentList = [...new Set(DASH.primaryDataset.map(d => d.parentCampaign))].sort((a,b) => a.localeCompare(b));
@@ -1311,25 +1491,24 @@ function initDashboard(opts = {}) {
     refreshDashboard();
   });
 
-  // Date mode toggle
-  document.getElementById('filter-date-mode').onclick = () => {
-    FILTERS.dateMode = FILTERS.dateMode === 'activity' ? 'courseStart' : 'activity';
-    document.getElementById('filter-date-label').textContent =
-      FILTERS.dateMode === 'activity' ? 'Activity' : 'Course start';
-    refreshDashboard();
-  };
-
-  // Reset filters
+  // Reset filters — both date ranges back to the auto-filled defaults plus
+  // the non-date filters back to their initial state. Triggers a re-stitch
+  // since date ranges changed.
   document.getElementById('btn-filter-reset').onclick = () => {
-    FILTERS.subTypeBuckets = new Set(CONFIG.dashboard.bucketOptions);
-    FILTERS.courseStatuses = new Set(['Cancelled/Withdrawn/Etc', 'Registered', 'Enrolled']);
+    FILTERS.subTypeBuckets  = new Set(CONFIG.dashboard.bucketOptions);
+    FILTERS.courseStatuses  = new Set(['Cancelled/Withdrawn/Etc', 'Registered', 'Enrolled']);
     FILTERS.parentCampaigns = null;
-    FILTERS.subTypes = null;
-    FILTERS.dateMode = 'activity';
-    DASH.parentSelected = new Set(DASH.parentList);
-    DASH.subTypeSelected = new Set(DASH.subTypeList);
-    sliderEl.noUiSlider.set([DASH.dateMinAvail.getTime(), DASH.dateMaxAvail.getTime()]);
-    document.getElementById('filter-date-label').textContent = 'Activity';
+    FILTERS.subTypes        = null;
+    DASH.parentSelected     = new Set(DASH.parentList);
+    DASH.subTypeSelected    = new Set(DASH.subTypeList);
+    if (DASH.focusDefault) {
+      FILTERS.focus.dateMin = DASH.focusDefault.dateMin;
+      FILTERS.focus.dateMax = DASH.focusDefault.dateMax;
+    }
+    if (DASH.influenceDefault) {
+      FILTERS.influence.dateMin = DASH.influenceDefault.dateMin;
+      FILTERS.influence.dateMax = DASH.influenceDefault.dateMax;
+    }
     renderChipGroup('filter-bucket-chips', CONFIG.dashboard.bucketOptions, FILTERS.subTypeBuckets, (set) => {
       FILTERS.subTypeBuckets = set.size === 0 ? null : set;
       refreshDashboard();
@@ -1340,7 +1519,7 @@ function initDashboard(opts = {}) {
     });
     renderParentMultiselect();
     renderSubTypeMultiselect();
-    refreshDashboard();
+    onDateRangeChange();
   };
 
   DASH.initialized = true;
@@ -1616,10 +1795,11 @@ function renderCampaignSummaryTable(filtered) {
 
 function renderFilterSummary(filtered, all) {
   const summary = document.getElementById('filter-summary');
-  const dateLbl = FILTERS.dateMode === 'activity' ? 'activity date' : 'course start date';
+  const f = FILTERS.focus, i = FILTERS.influence;
   summary.innerHTML =
     `Showing <strong>${filtered.length.toLocaleString()}</strong> of ${all.length.toLocaleString()} Campaign Members ` +
-    `(${fmtDate(FILTERS.dateMin)} – ${fmtDate(FILTERS.dateMax)} on ${dateLbl})`;
+    `· Focus <strong>${fmtDate(f.dateMin)} – ${fmtDate(f.dateMax)}</strong>` +
+    ` · Influence <strong>${fmtDate(i.dateMin)} – ${fmtDate(i.dateMax)}</strong>`;
 
   // Disable the filtered-xlsx button when nothing's selected — generating an
   // empty xlsx is useless and the builders would throw on the empty cohort.
@@ -1729,11 +1909,15 @@ function funnelLabelPlugin() {
 /* --- Time-series chart -------------------------------------------------- */
 
 function renderTimeSeriesChart(filtered) {
-  // CM acquisition (primaryActivity) and PA conversion (secondaryCreated), filtered cohort only
+  // CM acquisition (primaryActivity) and PA conversion (secondaryCreated), filtered cohort only.
+  // X-axis spans Influence (the wider window) so CM lookback is visible; the
+  // PA-conversion line naturally falls inside Focus since stitch is Focus-bounded.
   const primaryDates = filtered.filter(d => d.primaryActivity).map(d => d.primaryActivity);
   const secondaryDates = filtered.filter(d => d.secondaryCreated).map(d => d.secondaryCreated);
 
-  const rangeMs = (FILTERS.dateMax && FILTERS.dateMin) ? FILTERS.dateMax - FILTERS.dateMin : 0;
+  const infMin = FILTERS.influence.dateMin;
+  const infMax = FILTERS.influence.dateMax;
+  const rangeMs = (infMax && infMin) ? infMax - infMin : 0;
   const days = rangeMs / ONE_DAY;
   const bin = days < 60 ? 'day' : days < 540 ? 'week' : 'month';
   const binStart = bin === 'day' ? startOfDay : bin === 'week' ? startOfWeek : startOfMonth;
@@ -1743,9 +1927,9 @@ function renderTimeSeriesChart(filtered) {
     return new Date(start.getFullYear(), start.getMonth() + 1, 1);
   };
 
-  // Build bin sequence covering the active range
-  const startBin = FILTERS.dateMin ? binStart(FILTERS.dateMin) : (primaryDates.length || secondaryDates.length ? binStart(new Date(Math.min(...[...primaryDates, ...secondaryDates].map(d => d.getTime())))) : new Date());
-  const endBin   = FILTERS.dateMax ? binStart(FILTERS.dateMax) : startBin;
+  // Build bin sequence covering Influence (or fall back to whatever dates we have)
+  const startBin = infMin ? binStart(infMin) : (primaryDates.length || secondaryDates.length ? binStart(new Date(Math.min(...[...primaryDates, ...secondaryDates].map(d => d.getTime())))) : new Date());
+  const endBin   = infMax ? binStart(infMax) : startBin;
   const bins = [];
   for (let cur = new Date(startBin.getTime()); cur <= endBin; cur = binAdvance(cur)) {
     bins.push(cur.getTime());
@@ -1946,6 +2130,10 @@ function setupDropZone(zoneEl, target, required, label) {
       validateHeaders(rows, required, label);
       STATE[target].rows = rows;
       STATE[target].fileName = file.name;
+      // Fresh data invalidates the cached parsed-date flags and the user's
+      // current Focus/Influence windows — autoFillDateRanges will re-seed
+      // from the new data on the next stitch.
+      clearActiveDateFilters();
       zoneEl.classList.add('loaded');
       // A fresh upload supersedes any "restored from last session" badge.
       zoneEl.classList.remove('from-cache');
@@ -1985,6 +2173,7 @@ function setupDropZone(zoneEl, target, required, label) {
       e.preventDefault();
       STATE[target].rows = null;
       STATE[target].fileName = null;
+      clearActiveDateFilters();
       zoneEl.classList.remove('loaded', 'from-cache');
       status.innerHTML = '';
       input.value = '';
@@ -2002,22 +2191,89 @@ function rerenderDownstream() {
   renderPreviewTable();
 }
 
+// Walks the primary + secondary rows once to find the date bounds that drive
+// the Focus + Influence default windows, and stashes them on DASH for the
+// slider min/max. Called from runStitch every time, but only writes into
+// FILTERS.* fields that are still null — so user-adjusted ranges survive a
+// re-stitch (e.g. a Reset Filters click hits the *Default values).
+function autoFillDateRanges() {
+  const dateOf = CONFIG.dashboard && CONFIG.dashboard.dateOf;
+  if (!dateOf || typeof dateOf.primary !== 'function' || typeof dateOf.secondary !== 'function') return;
+
+  // Influence — full span of primary date dimension (CM Update Date for Emory)
+  let infMin = null, infMax = null;
+  for (const r of STATE.primary.rows) {
+    const d = dateOf.primary(r);
+    if (!d) continue;
+    if (!infMin || d < infMin) infMin = d;
+    if (!infMax || d > infMax) infMax = d;
+  }
+  if (!infMin) { infMin = new Date(); infMax = new Date(); }
+  DASH.influenceMinAvail = startOfDay(infMin);
+  DASH.influenceMaxAvail = startOfDay(infMax);
+  DASH.influenceDefault  = { dateMin: DASH.influenceMinAvail, dateMax: DASH.influenceMaxAvail };
+
+  // Focus — month-rounded span of secondary date dimension (PA Created Date for Emory)
+  let focMin = null, focMax = null;
+  for (const r of STATE.secondary.rows) {
+    const d = dateOf.secondary(r);
+    if (!d) continue;
+    if (!focMin || d < focMin) focMin = d;
+    if (!focMax || d > focMax) focMax = d;
+  }
+  if (!focMin) { focMin = infMin; focMax = infMax; }
+  DASH.focusMinAvail = startOfMonth(focMin);
+  DASH.focusMaxAvail = endOfMonth(focMax);
+  DASH.focusDefault  = { dateMin: DASH.focusMinAvail, dateMax: DASH.focusMaxAvail };
+
+  // Seed FILTERS only on first stitch (or after a user clears them, e.g.
+  // re-upload). Subsequent re-stitches preserve the user's chosen window.
+  if (!FILTERS.focus.dateMin)     FILTERS.focus.dateMin     = DASH.focusDefault.dateMin;
+  if (!FILTERS.focus.dateMax)     FILTERS.focus.dateMax     = DASH.focusDefault.dateMax;
+  if (!FILTERS.influence.dateMin) FILTERS.influence.dateMin = DASH.influenceDefault.dateMin;
+  if (!FILTERS.influence.dateMax) FILTERS.influence.dateMax = DASH.influenceDefault.dateMax;
+}
+
+// Filter primary rows by Influence, secondary by Focus. Rows whose date
+// dimension is null are excluded (we can't place them on a time axis).
+function filterByActiveDateRanges() {
+  const dateOf = CONFIG.dashboard.dateOf;
+  const primaryInRange   = STATE.primary.rows.filter(r => dateInRange(dateOf.primary(r),   FILTERS.influence));
+  const secondaryInRange = STATE.secondary.rows.filter(r => dateInRange(dateOf.secondary(r), FILTERS.focus));
+  return { primaryInRange, secondaryInRange };
+}
+
 function runStitch(opts = {}) {
   if (!STATE.primary.rows || !STATE.secondary.rows) return;
+
+  // Date caches must exist before any date-aware filtering (autoFill walks
+  // rows via CONFIG.dashboard.dateOf, which reads the underscore-prefixed
+  // caches this populates). Idempotent — short-circuits on r._datesCached.
+  cacheParsedDatesOnRows();
+
+  // Resolve current Focus + Influence windows (first call seeds defaults;
+  // re-stitches after a date-range change preserve the user's choices).
+  autoFillDateRanges();
+
+  // Scope the stitch: secondary ∈ Focus, primary ∈ Influence.
+  const { primaryInRange, secondaryInRange } = filterByActiveDateRanges();
+
   const t0 = performance.now();
   try {
-    const result = stitch(STATE.primary.rows, STATE.secondary.rows);
-    STATE.stitched        = result.stitched;
-    STATE.unmatched       = result.unmatched;
-    STATE.methodCounts    = result.methodCounts;
+    const result = stitch(primaryInRange, secondaryInRange);
+    STATE.stitched         = result.stitched;
+    STATE.unmatched        = result.unmatched;
+    STATE.methodCounts     = result.methodCounts;
     STATE.testRemovedCount = result.testRemovedCount;
+    STATE.testRemovedRows  = result.testRemovedRows || { primary: [], secondary: [] };
+    STATE.rejectedMatches  = result.rejectedMatches || [];
   } catch (err) {
     console.error(err);
     showError('upload-error', `Stitch failed: ${err.message}`);
     return;
   }
   const t1 = performance.now();
-  console.log(`Stitch complete in ${(t1-t0).toFixed(0)}ms`);
+  console.log(`Stitch complete in ${(t1-t0).toFixed(0)}ms (${primaryInRange.length} primary × ${secondaryInRange.length} secondary)`);
 
   // Build the column list now that we know which headers each CSV provides.
   const primaryHeaders = STATE.primary.rows.length ? Object.keys(STATE.primary.rows[0]) : [];
@@ -2025,12 +2281,14 @@ function runStitch(opts = {}) {
   STATE.columns = buildColumnList(primaryHeaders, secondaryHeaders);
 
   // Reveal downstream sections
-  for (const id of ['step-stats','step-columns','step-preview','step-download']) {
-    document.getElementById(id).hidden = false;
+  for (const id of ['step-dates','step-stats','step-columns','step-preview','step-download']) {
+    const el = document.getElementById(id);
+    if (el) el.hidden = false;
   }
   renderKpis();
   renderColumnPicker(document.getElementById('column-list'), STATE.columns, rerenderDownstream);
   renderPreviewTable();
+  if (typeof renderDateRangesStep === 'function') renderDateRangesStep();
   // The 3 distribution charts (sub-type / parent / course) now live in the Dashboard tab
   // and render on demand via refreshDashboard, so they pick up the active filters.
 
@@ -2041,8 +2299,10 @@ function runStitch(opts = {}) {
 
   refreshResetButton();
 
-  // Auto-scroll only when the user clicked Stitch — restoring from cache shouldn't yank the page.
-  if (!opts.fromCache) {
+  // Auto-scroll only when the user clicked Stitch — restoring from cache
+  // shouldn't yank the page. opts.skipScroll lets re-stitch from a date
+  // change suppress scroll too even though it's not a cache restore.
+  if (!opts.fromCache && !opts.skipScroll) {
     document.getElementById('step-stats').scrollIntoView({ behavior: 'smooth', block: 'start' });
   }
 }
@@ -2116,7 +2376,10 @@ async function resetApp() {
   STATE.unmatched = null;
   STATE.methodCounts = null;
   STATE.testRemovedCount = 0;
+  STATE.testRemovedRows = { primary: [], secondary: [] };
+  STATE.rejectedMatches = null;
   STATE.columns = null;
+  clearActiveDateFilters();
 
   // Drop zones
   for (const target of ['primary', 'secondary']) {

@@ -103,9 +103,17 @@
   // row spine for the pivot. Cell counts themselves are COUNTIFS formulas
   // against the CampaignMembers table, so this aggregation only needs to
   // identify *which* parent/campaign rows to emit.
-  function aggregateCmStatusByCampaign() {
-    const { STATE } = rs();
-    const cmClean = STATE.primary.rows.filter(r => !isTestRow(r));
+  function aggregateCmStatusByCampaign(ctx) {
+    const { STATE, dateInRange } = rs();
+    const dateOf = ctx && ctx.dateOf;
+    const focus  = ctx && ctx.focus;
+    // Scope to CMs ∈ Focus so the Campaign Summary's row spine matches the
+    // CampaignMembers (Focus) table its COUNTIFS formulas reference. Without
+    // this filter, older CMs (in Influence but outside Focus) would appear as
+    // (parent, campaign) rows with all-zero counts.
+    const cmClean = STATE.primary.rows.filter(r =>
+      !isTestRow(r) && (!dateOf || dateInRange(dateOf.primary(r), focus))
+    );
     const primaryToSecondaries = new Map();
     for (const s of STATE.stitched) {
       if (!primaryToSecondaries.has(s.primary)) primaryToSecondaries.set(s.primary, []);
@@ -135,15 +143,24 @@
 
   // ----- Sheet 1: Stitched Data ---------------------------------------------
   function buildStitchedSheet(wb, ctx) {
-    const { STATE, FONT_HEADER, FONT_BODY, FILL_NAVY, BORDER_THIN, getCellValue } = rs();
+    const { STATE, FONT_HEADER, FONT_BODY, FILL_NAVY, BORDER_THIN, getCellValue, parseSfDate } = rs();
     const ws = wb.addWorksheet('Stitched Data', { views: [{ state: 'frozen', ySplit: 1 }] });
     const enabled = STATE.columns.filter(c => c.enabled);
     if (enabled.length === 0) throw new Error('Column picker: at least one column must be selected.');
 
+    // Columns flagged `type: 'date'` in CONFIG.defaultColumns get their raw
+    // Salesforce date strings parsed into Date objects so Excel writes them
+    // as real date cells (sortable, filterable) rather than text.
     const tableColumns = enabled.map(c => ({ name: c.label, filterButton: true }));
     const tableRows = STATE.stitched.map(r => enabled.map(col => {
       const v = getCellValue(r, col);
       if (col.key === 'course_score') return Number(v);
+      if (col.type === 'date') {
+        if (v == null || v === '') return null;
+        if (v instanceof Date) return v;
+        const d = parseSfDate(v);
+        return d || v;  // fall back to raw string if unparseable
+      }
       return v == null ? '' : v;
     }));
     // ExcelJS requires at least one row in addTable; pad with empty if no data.
@@ -170,9 +187,17 @@
       cell.border = BORDER_THIN;
     });
 
-    // Body styling + column widths (autosize, capped at 45 chars).
+    // Body styling + column widths. Date columns get a fixed width (~12) and
+    // an m/d/yyyy display format so Excel sorts them as dates; other columns
+    // autosize against the longest stringified value.
     for (let c = 1; c <= enabled.length; c++) {
-      let maxLen = enabled[c-1].label.length;
+      const col = enabled[c-1];
+      if (col.type === 'date') {
+        ws.getColumn(c).width  = 12;
+        ws.getColumn(c).numFmt = 'm/d/yyyy';
+        continue;
+      }
+      let maxLen = col.label.length;
       for (let r = 0; r < tableRows.length; r++) {
         const v = tableRows[r][c-1];
         const s = v == null ? '' : String(v);
@@ -251,6 +276,20 @@
     titleCell.font = { name: 'Arial', size: 14, bold: true, color: { argb: NAVY_ARGB } };
     titleCell.alignment = { horizontal: 'left', vertical: 'middle' };
     ws.getRow(1).height = 26;
+
+    // ===== Note row (A2:E2) — italic gray scope explanation =====
+    // Cap at column E to avoid overlapping the Parent Campaign table on the
+    // right (its header sits in G2). Row 2 height gets inflated to fit the
+    // wrapped note, which also stretches G2 — that's an accepted trade-off.
+    const noteText = (CONFIG.dashboard && CONFIG.dashboard.labels && CONFIG.dashboard.labels.noteParticipantSummary) || '';
+    if (noteText) {
+      ws.mergeCells('A2:E2');
+      const noteCell = ws.getCell('A2');
+      noteCell.value = noteText;
+      noteCell.font  = { name: 'Arial', size: 9.5, italic: true, color: { argb: 'FF6B7280' } };
+      noteCell.alignment = { horizontal: 'left', vertical: 'top', wrapText: true };
+      ws.getRow(2).height = 56;
+    }
 
     // ===== KPI block (A3:B5) =====
     const kpiNavyCell = (row, label, formulaOrValue, isFormula) => {
@@ -578,12 +617,16 @@
   // are several: Enrolled > Registered > anything else). Wrapped as an Excel
   // Table named "CampaignMembers" so the Course Status column drives the
   // Campaign Summary's COUNTIFS formulas.
-  function buildCampaignMembersSheet(wb, ctx) {
+  // Shared body for both Campaign Members sheets. `scope(row)` decides which
+  // CMs land in this sheet — used to split into Focus / Older variants while
+  // keeping the column layout, sort order, and styling identical.
+  function buildCampaignMembersScopedSheet(wb, ctx, opts) {
     const { STATE, FONT_HEADER, FONT_BODY, FILL_NAVY, BORDER_THIN } = rs();
+    const { sheetName, tableName, scope } = opts;
 
-    const ws = wb.addWorksheet('Campaign Members', { views: [{ state: 'frozen', ySplit: 1 }] });
+    const ws = wb.addWorksheet(sheetName, { views: [{ state: 'frozen', ySplit: 1 }] });
 
-    const cmClean = STATE.primary.rows.filter(r => !isTestRow(r));
+    const cmClean = STATE.primary.rows.filter(r => !isTestRow(r) && scope(r));
 
     // Reverse-index: CM row → list of stitched matches (each carries pa, method, score)
     const primaryToStitched = new Map();
@@ -605,6 +648,7 @@
       'Last Name', 'First Name', 'Email', 'Phone', 'Contact ID',
       'Member Status', 'Member Status Update Date', 'Member First Responded Date',
       'CM Related Course', 'Course Status', 'Match Method', 'Course Match Score',
+      'Days to Convert',
       'PA Course Name', 'PA Status', 'PA Created Date',
       'PA Course Instance: Start Date', 'PA Contact ID',
     ];
@@ -626,6 +670,17 @@
       const courseStatus = deriveCourseStatus(matches);
       const best = matches.length === 0 ? null : matches.reduce((a, b) => rankPa(b) > rankPa(a) ? b : a);
       const pa = best ? best.secondary : null;
+      // Engagement → registration lag (whole days). Null if no PA match or
+      // either date is missing. Goes in the new "Days to Convert" column.
+      let daysToConvert = '';
+      if (pa) {
+        const updated = cm._memberStatusUpdate;
+        const created = pa._secondaryCreated;
+        if (updated && created) daysToConvert = Math.round((created.getTime() - updated.getTime()) / 86400000);
+      }
+      // Date cells get the pre-parsed Date objects from the row caches so
+      // Excel writes them as real date cells (sortable, filterable). Falls
+      // back to null when unparsed/blank — Excel renders blank.
       rows.push([
         cm['Parent Campaign Name'] || '',
         cm['Campaign Name'] || '',
@@ -637,16 +692,17 @@
         cm['Phone'] || '',
         cm['Contact ID'] || '',
         cm['Member Status'] || '',
-        cm['Member Status Update Date'] || '',
-        cm['Member First Responded Date'] || '',
+        cm._memberStatusUpdate   || null,
+        cm._memberFirstResponded || null,
         cm['Related Course'] || '',
         courseStatus,
         best ? best.method : '',
         best ? best.score : '',
+        daysToConvert,
         pa ? (pa['Course Name'] || '') : '',
         pa ? (pa['Status'] || '') : '',
-        pa ? (pa['Program Participant: Created Date'] || '') : '',
-        pa ? (pa['Course Instance: Start Date'] || '') : '',
+        pa ? (pa._secondaryCreated || null) : null,
+        pa ? (pa._courseStart      || null) : null,
         pa ? (pa['Contact ID'] || '') : '',
       ]);
     }
@@ -655,7 +711,7 @@
     if (rows.length === 0) rows.push(headers.map(() => ''));
 
     ws.addTable({
-      name: 'CampaignMembers',
+      name: tableName,
       ref: 'A1',
       headerRow: true,
       style: { theme: 'TableStyleMedium2', showRowStripes: true },
@@ -674,8 +730,20 @@
       cell.border = BORDER_THIN;
     });
 
-    // Column widths (autosize, capped at 45 chars).
+    // Date columns get fixed width + m/d/yyyy display so Excel sorts them as
+    // real dates. Indices below are 1-based and pinned to the headers array
+    // above (Member Status Update Date, Member First Responded Date, PA
+    // Created Date, PA Course Instance: Start Date).
+    const DATE_COL_INDICES = new Set([11, 12, 20, 21]);
+
+    // Column widths. Date columns hardcoded; everything else autosizes against
+    // the longest stringified value, capped at 45 chars.
     for (let c = 1; c <= headers.length; c++) {
+      if (DATE_COL_INDICES.has(c)) {
+        ws.getColumn(c).width  = 12;
+        ws.getColumn(c).numFmt = 'm/d/yyyy';
+        continue;
+      }
       let maxLen = headers[c - 1].length;
       for (const row of rows) {
         const v = row[c - 1];
@@ -695,13 +763,172 @@
 
     return {
       ws,
-      sheetName: 'Campaign Members',
-      tableName: 'CampaignMembers',
+      sheetName,
+      tableName,
       dataLastRow: rows.length + 1,
     };
   }
 
-  // ----- Sheet 4: Campaign Summary ------------------------------------------
+  // ----- Sheet 3: Campaign Members (Focus) — CMs ∈ Focus -------------------
+  // tableName 'CampaignMembers' preserved so the Campaign Summary's COUNTIFS
+  // formulas keep referencing the Focus-scoped table without change.
+  function buildCampaignMembersSheet(wb, ctx) {
+    const { dateInRange } = rs();
+    const dateOf = ctx.dateOf;
+    return buildCampaignMembersScopedSheet(wb, ctx, {
+      sheetName: 'Campaign Members (Focus)',
+      tableName: 'CampaignMembers',
+      scope: (cm) => {
+        if (!dateOf) return true;   // no date dimension → include all
+        const d = dateOf.primary(cm);
+        return d && dateInRange(d, ctx.focus);
+      },
+    });
+  }
+
+  // ----- Sheet 4: Campaign Members (Older) — CMs ∈ Influence ∖ Focus -------
+  // Older CMs (matched and unmatched) that fell inside the broader Influence
+  // window but outside Focus. Their own table so Campaign Summary stays
+  // Focus-only.
+  function buildCampaignMembersOlderSheet(wb, ctx) {
+    const { dateInRange } = rs();
+    const dateOf = ctx.dateOf;
+    return buildCampaignMembersScopedSheet(wb, ctx, {
+      sheetName: 'Campaign Members (Older)',
+      tableName: 'CampaignMembersOlder',
+      scope: (cm) => {
+        if (!dateOf) return false;
+        const d = dateOf.primary(cm);
+        if (!d) return false;
+        return dateInRange(d, ctx.influence) && !dateInRange(d, ctx.focus);
+      },
+    });
+  }
+
+  // ----- Sheet 5: Post-Reg Engagement (conditional) ------------------------
+  // Lists the candidate matches matchValidator rejected because the CM's
+  // First Responded Date is after the PA's Created Date. Built only when
+  // there's something to show — returns null otherwise so the engine skips
+  // adding the worksheet.
+  function buildPostRegEngagementSheet(wb, ctx) {
+    const { STATE, FONT_HEADER, FONT_BODY, FILL_NAVY, BORDER_THIN, NAVY_ARGB, colLetter } = rs();
+
+    const rejected = (STATE.rejectedMatches || []).filter(r =>
+      !r.reason || r.reason === 'engagement-after-registration'
+    );
+    if (rejected.length === 0) return null;
+
+    const ws = wb.addWorksheet('Post-Reg Engagement', { views: [{ state: 'frozen', ySplit: 3 }] });
+
+    // Title (row 1)
+    ws.mergeCells('A1:O1');
+    const title = ws.getCell('A1');
+    title.value = 'Post-Registration Engagement (excluded from matching)';
+    title.font = { name: 'Arial', size: 14, bold: true, color: { argb: NAVY_ARGB } };
+    title.alignment = { horizontal: 'left', vertical: 'middle' };
+    ws.getRow(1).height = 26;
+
+    // Italic-gray scope note (row 2)
+    const noteText = (CONFIG.dashboard && CONFIG.dashboard.labels && CONFIG.dashboard.labels.notePostRegEngagement) || '';
+    if (noteText) {
+      ws.mergeCells('A2:O2');
+      const noteCell = ws.getCell('A2');
+      noteCell.value = noteText;
+      noteCell.font  = { name: 'Arial', size: 9.5, italic: true, color: { argb: 'FF6B7280' } };
+      noteCell.alignment = { horizontal: 'left', vertical: 'top', wrapText: true };
+      ws.getRow(2).height = 56;
+    }
+
+    // Header row 3
+    const headers = [
+      'Parent Campaign Name', 'Campaign Name', 'Sub-Type',
+      'Last Name', 'First Name', 'Email', 'Contact ID',
+      'Member First Responded Date', 'Member Status Update Date',
+      'PA Created Date', 'Days Reg Preceded Engagement',
+      'Match Method', 'PA Course Name', 'PA Status', 'PA Contact ID',
+    ];
+    headers.forEach((h, i) => {
+      const cell = ws.getCell(`${colLetter(i+1)}3`);
+      cell.value = h;
+      cell.font = FONT_HEADER;
+      cell.fill = FILL_NAVY;
+      cell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
+      cell.border = BORDER_THIN;
+    });
+    ws.getRow(3).height = 32;
+
+    // Compute days-preceded per row and sort by the worst offenders first.
+    const enriched = rejected.map(rec => {
+      const cm = rec.primary, pa = rec.secondary;
+      const responded = cm._memberFirstResponded;
+      const created   = pa._secondaryCreated;
+      const daysPreceded = (responded && created)
+        ? Math.round((responded.getTime() - created.getTime()) / 86400000)
+        : '';
+      return { rec, daysPreceded };
+    }).sort((a, b) => {
+      const ax = typeof a.daysPreceded === 'number' ? a.daysPreceded : 0;
+      const bx = typeof b.daysPreceded === 'number' ? b.daysPreceded : 0;
+      return bx - ax;
+    });
+
+    // Body
+    let r = 4;
+    for (const { rec, daysPreceded } of enriched) {
+      const cm = rec.primary, pa = rec.secondary;
+      const cells = [
+        cm['Parent Campaign Name'] || '',
+        cm['Campaign Name'] || '',
+        cm['Sub-Type'] || '',
+        cm['Last Name'] || '',
+        cm['First Name'] || '',
+        cm['Email'] || '',
+        cm['Contact ID'] || '',
+        cm._memberFirstResponded || null,
+        cm._memberStatusUpdate   || null,
+        pa._secondaryCreated     || null,
+        daysPreceded,
+        rec.method,
+        pa['Course Name'] || '',
+        pa['Status'] || '',
+        pa['Contact ID'] || '',
+      ];
+      cells.forEach((v, i) => {
+        const cell = ws.getCell(`${colLetter(i+1)}${r}`);
+        cell.value = v;
+        cell.font  = FONT_BODY;
+        cell.alignment = { vertical: 'middle' };
+        cell.border = BORDER_THIN;
+      });
+      r++;
+    }
+
+    // Column widths + date formatting. Indices below are 1-based against `headers`.
+    const DATE_COL_INDICES = new Set([8, 9, 10]);   // First Responded, Status Update, PA Created
+    const FIXED_WIDTHS = {
+      1: 28, 2: 30, 3: 22,            // Parent / Campaign / Sub-Type
+      4: 16, 5: 16, 6: 26, 7: 14,     // Last / First / Email / Contact ID
+      11: 14,                          // Days Reg Preceded Engagement
+      12: 14,                          // Match Method
+      13: 38, 14: 14, 15: 14,         // PA Course Name / PA Status / PA Contact ID
+    };
+    for (let c = 1; c <= headers.length; c++) {
+      if (DATE_COL_INDICES.has(c)) {
+        ws.getColumn(c).width  = 12;
+        ws.getColumn(c).numFmt = 'm/d/yyyy';
+        continue;
+      }
+      ws.getColumn(c).width = FIXED_WIDTHS[c] || 14;
+    }
+
+    return {
+      ws,
+      sheetName: 'Post-Reg Engagement',
+      dataLastRow: r - 1,
+    };
+  }
+
+  // ----- Sheet 6: Campaign Summary ------------------------------------------
   // Pivot-style view of CM counts by Course Status bucket, grouped by Parent
   // Campaign → Campaign Name with subtotals and a grand total. Count cells are
   // COUNTIFS formulas against the CampaignMembers structured table, so editing
@@ -714,11 +941,11 @@
       colLetter, escapeFormula,
     } = rs();
 
-    const cmCtx = ctx.sheets['Campaign Members'];
-    if (!cmCtx) throw new Error('Campaign Summary builder ran before Campaign Members.');
+    const cmCtx = ctx.sheets['Campaign Members (Focus)'];
+    if (!cmCtx) throw new Error('Campaign Summary builder ran before Campaign Members (Focus).');
 
     const ws = wb.addWorksheet('Campaign Summary', { views: [{ state: 'frozen', ySplit: 3 }] });
-    const data = aggregateCmStatusByCampaign();
+    const data = aggregateCmStatusByCampaign(ctx);
 
     // Structured table references — auto-resize when rows are added/removed.
     const tbl = cmCtx.tableName;
@@ -733,6 +960,17 @@
     title.font = { name: 'Arial', size: 14, bold: true, color: { argb: NAVY_ARGB } };
     title.alignment = { horizontal: 'left', vertical: 'middle' };
     ws.getRow(1).height = 26;
+
+    // Note row 2 — italic gray explanation of the Focus-only scope.
+    ws.mergeCells('A2:G2');
+    const noteCell = ws.getCell('A2');
+    const noteText = (CONFIG.dashboard && CONFIG.dashboard.labels && CONFIG.dashboard.labels.noteCampaignSummary) || '';
+    if (noteText) {
+      noteCell.value = noteText;
+      noteCell.font  = { name: 'Arial', size: 10, italic: true, color: { argb: 'FF6B7280' } };
+      noteCell.alignment = { horizontal: 'left', vertical: 'top', wrapText: true };
+      ws.getRow(2).height = 44;
+    }
 
     // Header row 3
     const headers = ['Parent Campaign', 'Campaign Name', 'Not Converted', 'Cancelled/Withdrawn/Etc', 'Enrolled', 'Registered', 'Total'];
@@ -881,7 +1119,7 @@
     // 'primary' | 'secondary' rename is part of the Slice F sweep, alongside
     // STATE.primary / STATE.secondary → STATE.primary / STATE.secondary.
     defaultColumns: [
-      { key:'pa_created',         label:'Program Participant: Created Date', source:'secondary',     sourceField:'Program Participant: Created Date' },
+      { key:'pa_created',         label:'Program Participant: Created Date', source:'secondary',     sourceField:'Program Participant: Created Date', type:'date' },
       { key:'course_registered',  label:'Course (Registered)',                source:'secondary',     sourceField:'Course Name' },
       { key:'status',             label:'Status',                             source:'secondary',     sourceField:'Status' },
       { key:'last_name',          label:'Last Name',                          source:'secondary',     sourceField:'Last Name', fallbackField:'Last Name' },
@@ -891,15 +1129,16 @@
       { key:'campaign',           label:'Campaign Name',                      source:'primary',     sourceField:'Campaign Name' },
       { key:'subtype_bucket',     label:'Sub-Type Bucket',                    source:'derived',sourceField:'subtype_bucket' },
       { key:'subtype',            label:'Sub-Type',                           source:'primary',     sourceField:'Sub-Type' },
-      { key:'course_start',       label:'Course Instance: Start Date',        source:'secondary',     sourceField:'Course Instance: Start Date' },
-      { key:'first_responded',    label:'Member First Responded Date',        source:'primary',     sourceField:'Member First Responded Date' },
-      { key:'status_update',      label:'Member Status Update Date',          source:'primary',     sourceField:'Member Status Update Date' },
+      { key:'course_start',       label:'Course Instance: Start Date',        source:'secondary',     sourceField:'Course Instance: Start Date', type:'date' },
+      { key:'first_responded',    label:'Member First Responded Date',        source:'primary',     sourceField:'Member First Responded Date', type:'date' },
+      { key:'status_update',      label:'Member Status Update Date',          source:'primary',     sourceField:'Member Status Update Date', type:'date' },
       { key:'cm_related_course',  label:'CM Related Course',                  source:'primary',     sourceField:'Related Course' },
       { key:'phone',              label:'Phone',                              source:'secondary',     sourceField:'Phone', fallbackField:'Phone' },
       { key:'pa_contact_id',      label:'Contact ID (PA)',                    source:'secondary',     sourceField:'Contact ID' },
       { key:'cm_contact_id',      label:'Contact ID (CM)',                    source:'primary',     sourceField:'Contact ID' },
       { key:'match_method',       label:'Match Method',                       source:'derived',sourceField:'match_method' },
       { key:'course_score',       label:'Course Match Score',                 source:'derived',sourceField:'course_score' },
+      { key:'days_to_convert',    label:'Days to Convert',                    source:'derived',sourceField:'days_to_convert' },
     ],
 
     // ----- Match strategy (declarative; engine still uses indexCm + findCmMatches
@@ -935,6 +1174,39 @@
       subtype_bucket: (primary)                        => bucketSubType(primary['Sub-Type']),
       match_method:   (primary, secondary, matchInfo)  => matchInfo && matchInfo.method,
       course_score:   (primary, secondary, matchInfo)  => matchInfo && matchInfo.score,
+      // Whole-day count between Member Status Update Date (engagement) and
+      // Program Participant: Created Date (registration). Null when either
+      // date is missing or the row isn't a stitched match. Reads the parsed-
+      // date caches the engine populates pre-stitch (_memberStatusUpdate /
+      // _secondaryCreated).
+      days_to_convert: (primary, secondary) => {
+        if (!primary || !secondary) return null;
+        const updated = primary._memberStatusUpdate;
+        const created = secondary._secondaryCreated;
+        if (!updated || !created) return null;
+        return Math.round((created.getTime() - updated.getTime()) / 86400000);
+      },
+    },
+
+    // ----- Match validator -------------------------------------------------
+    // Engine calls this for every candidate (primary, secondary) pair after
+    // matchStrategy finds them. Returning true keeps the candidate; returning
+    // { valid:false, reason } drops it. For Emory: reject when the CM's
+    // First Responded Date is AFTER the PA's Created Date — the form
+    // submission happened after the registration, so it couldn't logically
+    // have driven it. Rejections surface on the "Post-Reg Engagement" sheet
+    // (built only when there's something to show).
+    //
+    // Note: First Responded (NOT Member Status Update) is the right anchor
+    // here. Status Update can drift forward over time even for someone whose
+    // initial engagement was long before registration.
+    matchValidator: (primary, secondary) => {
+      const responded = primary._memberFirstResponded;
+      const created   = secondary._secondaryCreated;
+      // Missing dates — can't validate; default to accepting.
+      if (!responded || !created) return true;
+      if (responded.getTime() <= created.getTime()) return true;
+      return { valid: false, reason: 'engagement-after-registration' };
     },
 
     // ----- CM-level Course Status derivation (load-bearing, see helper) ----
@@ -951,10 +1223,14 @@
     // embeds happen inline inside buildParticipantSummarySheet so the anchor
     // rows can be computed from the table sizes it just laid out.
     outputSheets: [
-      { name: 'Stitched Data',       builder: buildStitchedSheet },
-      { name: 'Participant Summary', builder: buildParticipantSummarySheet },
-      { name: 'Campaign Members',    builder: buildCampaignMembersSheet },
-      { name: 'Campaign Summary',    builder: buildCampaignSummarySheet },
+      { name: 'Stitched Data',             builder: buildStitchedSheet },
+      { name: 'Participant Summary',       builder: buildParticipantSummarySheet },
+      { name: 'Campaign Members (Focus)',  builder: buildCampaignMembersSheet },
+      { name: 'Campaign Members (Older)',  builder: buildCampaignMembersOlderSheet },
+      { name: 'Campaign Summary',          builder: buildCampaignSummarySheet },
+      // Conditional — builder returns null and no worksheet is added when
+      // there are no rejected matches to surface.
+      { name: 'Post-Reg Engagement',       builder: buildPostRegEngagementSheet },
     ],
 
     // ----- Dashboard layout ------------------------------------------------
@@ -971,6 +1247,17 @@
         'Enrolled':                '#1f7a3a',   // green
       },
       bucketOptions: ['Website', 'Social', 'Unknown'],
+
+      // Date dimension extractors — the engine reads these to scope the
+      // stitch (primary by Influence, secondary by Focus) and to drive the
+      // dashboard's two date sliders. Functions return Date | null so the
+      // engine can decide what to do with rows lacking a parseable date.
+      // cacheParsedDatesOnRows (engine-side) populates the underscore-prefixed
+      // caches these point at, pre-stitch.
+      dateOf: {
+        primary:   (row) => row && row._memberStatusUpdate || null,
+        secondary: (row) => row && row._secondaryCreated   || null,
+      },
 
       // User-facing strings. The engine reads these via [data-label] /
       // [data-label-title] attributes in index.html (painted by
@@ -1008,7 +1295,17 @@
         filterSubTypeAll:    'All sub-types ▾',
         filterBucketLabel:   'Sub-Type Bucket',
         filterStatusLabel:   'Course Status',
-        dateModeToggleTitle: 'Toggle between Activity date (CM update / PA created) and Course start date',
+
+        // Date Ranges step (Configure tab) + dashboard dual sliders
+        stepDateRangesHeading: 'Date ranges',
+        stepDateRangesBlurb:   'Focus + Influence windows',
+        stepDateRangesHelp:    'These windows scope the stitch. Focus narrows which Participant registrations are counted; Influence is the broader pool of Campaign Member activity that might have driven those registrations. Defaults auto-fill from your uploads.',
+        focusRangeLabel:       'Focus Date Range',
+        focusRangeSub:         'Participant Created Date',
+        focusRangeHelp:        'The primary window of activity you’re analyzing. Drives both the Participant Summary (registrations created in this range) and the Campaign Summary (Campaign Member engagement within this range). Defaults to the first day of the earliest Participant month through the last day of the latest.',
+        influenceRangeLabel:   'Influence Date Range',
+        influenceRangeSub:     'Campaign Member Updated Date',
+        influenceRangeHelp:    'The broader window of Campaign Member engagement eligible to match Participants in Focus. Should start at least 1–2 years before Focus so earlier campaign touches still count. Defaults to the full span of your CM data.',
 
         // Filter-bar "Generate xlsx (current filter)" button
         btnFilteredXlsxLabel: 'Generate xlsx (current filter)',
@@ -1022,6 +1319,13 @@
 
         // "Slice it on the Dashboard" callout sub-line
         calloutSub: 'Filter by date, parent campaign, sub-type, or status — and drill into any chart segment.',
+
+        // xlsx italic-gray notes rendered under each affected sheet title.
+        // Explain to the recipient why Participant and Campaign Summary
+        // counts may differ even though they come from the same dataset.
+        noteParticipantSummary: 'Counts include all registrations in the Focus Date Range, matched against Campaign Members whose update date falls within the (wider) Influence Date Range. If this is higher than the Campaign Summary’s Grand Total, that’s expected — Campaign Summary is scoped to engagement within Focus Date Range only.',
+        noteCampaignSummary:    'Counts include only Campaign Members whose updated date falls within the Focus Date Range. Older Campaign Members that contributed to registrations in Focus live in the “Campaign Members (Older)” sheet. Counts here will be lower than the Participant Summary’s because of this narrower scope.',
+        notePostRegEngagement:  'Candidate matches excluded from the stitch because the Campaign Member’s First Responded Date is after the Participant’s Created Date — the form submission happened after the registration, so it couldn’t logically have influenced it. Review and clean the underlying data if any of these look like real attribution.',
       },
     },
   });

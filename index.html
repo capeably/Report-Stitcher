@@ -9,7 +9,6 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/nouislider@15.7.1/dist/nouislider.min.css">
 <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -124,6 +123,21 @@
         <span><span data-label="testRemovedLabel">Test rows removed:</span> <strong id="test-removed">0</strong></span>
       </div>
 
+      <!-- Removed test rows — populated by renderTestRowsRemoved; hidden when count is 0 -->
+      <div class="test-rows-removed" id="test-rows-removed" hidden>
+        <p class="test-rows-heading">Removed test rows</p>
+        <div class="test-rows-grid">
+          <div class="test-rows-col" id="test-rows-primary-col" hidden>
+            <strong class="test-rows-source-heading"></strong>
+            <ul class="test-rows-list" id="test-rows-primary-list"></ul>
+          </div>
+          <div class="test-rows-col" id="test-rows-secondary-col" hidden>
+            <strong class="test-rows-source-heading"></strong>
+            <ul class="test-rows-list" id="test-rows-secondary-list"></ul>
+          </div>
+        </div>
+      </div>
+
       <a class="dashboard-callout" href="#dashboard" id="dashboard-callout">
         <span class="callout-spark" aria-hidden="true">
           <span></span><span></span><span></span><span></span>
@@ -137,10 +151,50 @@
       </a>
     </section>
 
-    <!-- Step 3: Column picker -->
-    <section class="step" id="step-columns" hidden>
+    <!-- Step 3: Date ranges -->
+    <section class="step" id="step-dates" hidden>
       <div class="step-head">
         <span class="step-num">3</span>
+        <h2 data-label="stepDateRangesHeading">Date ranges</h2>
+        <span class="step-blurb" data-label="stepDateRangesBlurb">Focus + Influence windows</span>
+      </div>
+      <small data-label="stepDateRangesHelp">These windows scope the stitch. Focus narrows which Participant registrations are counted; Influence is the broader pool of Campaign Member activity eligible to match them. Defaults auto-fill from your uploads.</small>
+      <div class="date-ranges-grid">
+        <div class="date-range-card" id="card-focus">
+          <div class="date-range-head">
+            <strong data-label="focusRangeLabel">Focus Date Range</strong>
+            <span class="date-range-sub" data-label="focusRangeSub">Participant Created Date</span>
+          </div>
+          <small data-label="focusRangeHelp">The primary window of activity you’re analyzing. Drives both the Participant Summary (registrations created in this range) and the Campaign Summary (Campaign Member engagement within this range). Defaults to the first day of the earliest Participant month through the last day of the latest.</small>
+          <div class="date-range-inputs">
+            <input type="date" id="cfg-focus-min" class="date-input" aria-label="Focus start date">
+            <span class="date-range-sep">to</span>
+            <input type="date" id="cfg-focus-max" class="date-input" aria-label="Focus end date">
+          </div>
+        </div>
+        <div class="date-range-card" id="card-influence">
+          <div class="date-range-head">
+            <strong data-label="influenceRangeLabel">Influence Date Range</strong>
+            <span class="date-range-sub" data-label="influenceRangeSub">Campaign Member Updated Date</span>
+          </div>
+          <small data-label="influenceRangeHelp">The broader window of Campaign Member engagement eligible to match Participants in Focus. Should start at least 1–2 years before Focus so earlier campaign touches still count. Defaults to the full span of your CM data.</small>
+          <div class="date-range-inputs">
+            <input type="date" id="cfg-influence-min" class="date-input" aria-label="Influence start date">
+            <span class="date-range-sep">to</span>
+            <input type="date" id="cfg-influence-max" class="date-input" aria-label="Influence end date">
+          </div>
+        </div>
+      </div>
+      <div class="action-row compact">
+        <button class="secondary" id="btn-dates-reset" type="button">Reset to defaults</button>
+        <span id="dates-status"></span>
+      </div>
+    </section>
+
+    <!-- Step 4: Column picker -->
+    <section class="step" id="step-columns" hidden>
+      <div class="step-head">
+        <span class="step-num">4</span>
         <h2>Configure columns</h2>
         <span class="step-blurb">Defaults match the locked layout</span>
       </div>
@@ -153,10 +207,10 @@
       <div class="column-list" id="column-list"></div>
     </section>
 
-    <!-- Step 4: Preview -->
+    <!-- Step 5: Preview -->
     <section class="step" id="step-preview" hidden>
       <div class="step-head">
-        <span class="step-num">4</span>
+        <span class="step-num">5</span>
         <h2>Stitched data preview</h2>
         <span class="step-blurb">First 100 rows</span>
       </div>
@@ -166,10 +220,10 @@
       </div>
     </section>
 
-    <!-- Step 5: Download -->
+    <!-- Step 6: Download -->
     <section class="step" id="step-download" hidden>
       <div class="step-head">
-        <span class="step-num">5</span>
+        <span class="step-num">6</span>
         <h2>Download xlsx</h2>
         <span class="step-blurb">Styled, multi-sheet, with charts</span>
       </div>
@@ -186,19 +240,27 @@
   <div id="tab-dashboard" class="tab-content" hidden>
 
     <section class="filter-bar" id="filter-bar">
-      <div class="filter-row">
-        <div class="filter-date">
-          <label>Date range</label>
-          <div id="date-slider"></div>
-          <div class="filter-meta">
-            <span class="filter-date-inputs">
-              <input type="date" id="filter-date-min" class="date-input" aria-label="Start date">
-              <span>to</span>
-              <input type="date" id="filter-date-max" class="date-input" aria-label="End date">
-            </span>
-            <button class="filter-mode-toggle" id="filter-date-mode" type="button" data-label-title="dateModeToggleTitle" title="Toggle between Activity date (CM update / PA created) and Course start date">
-              Date axis: <strong id="filter-date-label">Activity</strong> ⇅
-            </button>
+      <div class="filter-row filter-row-dates">
+        <div class="filter-date" id="filter-focus">
+          <label>
+            <strong data-label="focusRangeLabel">Focus Date Range</strong>
+            <span class="filter-date-sub" data-label="focusRangeSub">Participant Created Date</span>
+          </label>
+          <div class="filter-date-inputs">
+            <input type="date" id="filter-focus-min" class="date-input" aria-label="Focus start date">
+            <span class="date-range-sep">to</span>
+            <input type="date" id="filter-focus-max" class="date-input" aria-label="Focus end date">
+          </div>
+        </div>
+        <div class="filter-date" id="filter-influence">
+          <label>
+            <strong data-label="influenceRangeLabel">Influence Date Range</strong>
+            <span class="filter-date-sub" data-label="influenceRangeSub">Campaign Member Updated Date</span>
+          </label>
+          <div class="filter-date-inputs">
+            <input type="date" id="filter-influence-min" class="date-input" aria-label="Influence start date">
+            <span class="date-range-sep">to</span>
+            <input type="date" id="filter-influence-max" class="date-input" aria-label="Influence end date">
           </div>
         </div>
       </div>
@@ -337,7 +399,6 @@
 <script src="https://cdn.jsdelivr.net/npm/exceljs@4.4.0/dist/exceljs.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/file-saver@2.0.5/dist/FileSaver.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/nouislider@15.7.1/dist/nouislider.min.js"></script>
 
 <!-- Config registry + built-in configs (must load before app.js) -->
 <script src="configs/index.js"></script>
