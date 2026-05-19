@@ -143,8 +143,9 @@
 
   // ----- Sheet 1: Stitched Data ---------------------------------------------
   function buildStitchedSheet(wb, ctx) {
-    const { STATE, FONT_HEADER, FONT_BODY, FILL_NAVY, BORDER_THIN, getCellValue, parseSfDate } = rs();
+    const { STATE, FONT_HEADER, FONT_BODY, FILL_NAVY, BORDER_THIN, NAVY_ARGB, getCellValue, parseSfDate } = rs();
     const ws = wb.addWorksheet('Stitched Data', { views: [{ state: 'frozen', ySplit: 1 }] });
+    ws.properties.tabColor = { argb: NAVY_ARGB };
     const enabled = STATE.columns.filter(c => c.enabled);
     if (enabled.length === 0) throw new Error('Column picker: at least one column must be selected.');
 
@@ -238,6 +239,7 @@
     const { enabledCols, dataLastRow } = stitchedCtx;
 
     const ws = wb.addWorksheet('Participant Summary', { views: [{ showGridLines: false }] });
+    ws.properties.tabColor = { argb: NAVY_ARGB };
 
     const dataSheet = "'Stitched Data'";
     const lastRow = dataLastRow;
@@ -257,17 +259,33 @@
     const ref_parent  = colRef(colParent);
     const ref_course  = colRef(colCourse);
 
-    // Default column widths
+    // Conditional "Cancelled/Other" column — shown only if the stitched
+    // secondary set contains any Status values besides Registered or Enrolled.
+    // Counted via COUNTIFS (<>Registered, <>Enrolled, <>blank) so the bucket
+    // is computed in-formula rather than baked into the column source.
+    const hasOther = STATE.stitched.some(s => {
+      const st = (s.secondary['Status'] || '').toString().trim();
+      return st && st !== 'Registered' && st !== 'Enrolled';
+    });
+    const otherClause = ref_status
+      ? `${ref_status},"<>Registered",${ref_status},"<>Enrolled",${ref_status},"<>"`
+      : null;
+
+    // Default column widths. E + J hold Cancelled/Other (hidden below when
+    // !hasOther); F + K hold Total. Gap column F was removed in favor of the
+    // extra Total column — the wider G (38) provides enough visual separation
+    // from the sub-Type Total at F.
     ws.getColumn(1).width = 28;
     ws.getColumn(2).width = 30;
     ws.getColumn(3).width = 13;
     ws.getColumn(4).width = 13;
-    ws.getColumn(5).width = 13;
-    ws.getColumn(6).width = 3;
+    ws.getColumn(5).width = 15;
+    ws.getColumn(6).width = 13;
     ws.getColumn(7).width = 38;
     ws.getColumn(8).width = 13;
     ws.getColumn(9).width = 13;
-    ws.getColumn(10).width = 13;
+    ws.getColumn(10).width = 15;
+    ws.getColumn(11).width = 13;
 
     // ===== Title (A1:E1) =====
     ws.mergeCells('A1:E1');
@@ -336,17 +354,17 @@
     // ===== Sub-Type Bucket / Sub-Type table (A7 onwards) =====
     const agg = aggregateAll(STATE.stitched);
     let r = 7;
-    ws.mergeCells(`A${r}:E${r}`);
+    ws.mergeCells(`A${r}:F${r}`);
     const sectionTitle = ws.getCell(`A${r}`);
     sectionTitle.value = 'Sub-Type Bucket / Sub-Type';
     sectionTitle.font = { name: 'Arial', size: 12, bold: true, color: { argb: NAVY_ARGB } };
     sectionTitle.fill = FILL_GRAY;
     sectionTitle.alignment = { horizontal: 'center', vertical: 'middle' };
-    applyBorderRange(ws, `A${r}:E${r}`, BORDER_THIN);
+    applyBorderRange(ws, `A${r}:F${r}`, BORDER_THIN);
     r++;
 
     // Header row
-    const subHeaders = ['Sub-Type Bucket', 'Sub-Type', 'Registered', 'Enrolled', 'Total'];
+    const subHeaders = ['Sub-Type Bucket', 'Sub-Type', 'Registered', 'Enrolled', 'Cancelled/Other', 'Total'];
     subHeaders.forEach((label, idx) => {
       const cell = ws.getCell(`${colLetter(idx+1)}${r}`);
       cell.value = label;
@@ -376,12 +394,14 @@
       if (ref_subBkt && ref_status) {
         ws.getCell(`C${r}`).value = { formula: `COUNTIFS(${ref_subBkt},$A${r},${ref_status},"Registered")` };
         ws.getCell(`D${r}`).value = { formula: `COUNTIFS(${ref_subBkt},$A${r},${ref_status},"Enrolled")` };
+        ws.getCell(`E${r}`).value = { formula: `COUNTIFS(${ref_subBkt},$A${r},${otherClause})` };
       } else {
         ws.getCell(`C${r}`).value = details.reduce((a,b)=>a+b.reg,0);
         ws.getCell(`D${r}`).value = details.reduce((a,b)=>a+b.enr,0);
+        ws.getCell(`E${r}`).value = 0;
       }
-      ws.getCell(`E${r}`).value = { formula: `C${r}+D${r}` };
-      ['C','D','E'].forEach(c => {
+      ws.getCell(`F${r}`).value = { formula: `C${r}+D${r}+E${r}` };
+      ['C','D','E','F'].forEach(c => {
         const cell = ws.getCell(`${c}${r}`);
         cell.font = { name: 'Arial', size: 11, bold: true, color: { argb: NAVY_ARGB } };
         cell.fill = FILL_LBLUE;
@@ -402,12 +422,14 @@
         if (ref_sub && ref_status) {
           ws.getCell(`C${r}`).value = { formula: `COUNTIFS(${ref_sub},"${escapeFormula(d.name)}",${ref_status},"Registered")` };
           ws.getCell(`D${r}`).value = { formula: `COUNTIFS(${ref_sub},"${escapeFormula(d.name)}",${ref_status},"Enrolled")` };
+          ws.getCell(`E${r}`).value = { formula: `COUNTIFS(${ref_sub},"${escapeFormula(d.name)}",${otherClause})` };
         } else {
           ws.getCell(`C${r}`).value = d.reg;
           ws.getCell(`D${r}`).value = d.enr;
+          ws.getCell(`E${r}`).value = 0;
         }
-        ws.getCell(`E${r}`).value = { formula: `C${r}+D${r}` };
-        ['C','D','E'].forEach(c => {
+        ws.getCell(`F${r}`).value = { formula: `C${r}+D${r}+E${r}` };
+        ['C','D','E','F'].forEach(c => {
           const cell = ws.getCell(`${c}${r}`);
           cell.font = FONT_BODY;
           cell.alignment = { horizontal: 'center', vertical: 'middle' };
@@ -428,30 +450,33 @@
     ws.getCell(`B${r}`).fill = FILL_GRAY;
     ws.getCell(`C${r}`).value = { formula: 'B4' };
     ws.getCell(`D${r}`).value = { formula: 'B5' };
-    ws.getCell(`E${r}`).value = { formula: `C${r}+D${r}` };
-    ['A','B','C','D','E'].forEach(c => {
+    ws.getCell(`E${r}`).value = ref_status
+      ? { formula: `COUNTIFS(${otherClause})` }
+      : 0;
+    ws.getCell(`F${r}`).value = { formula: `C${r}+D${r}+E${r}` };
+    ['A','B','C','D','E','F'].forEach(c => {
       const cell = ws.getCell(`${c}${r}`);
       cell.fill = FILL_GRAY;
       cell.font = { name: 'Arial', size: 11, bold: true, color: { argb: NAVY_ARGB } };
       cell.alignment = { horizontal: c === 'A' || c === 'B' ? 'left' : 'center', vertical: 'middle' };
       cell.border = BORDER_MED_BOTTOM;
-      if (c === 'C' || c === 'D' || c === 'E') cell.numFmt = '#,##0';
+      if (c === 'C' || c === 'D' || c === 'E' || c === 'F') cell.numFmt = '#,##0';
     });
     const subTableLastRow = r;
     r++;
 
-    // ===== Parent Campaign table (G1:J?) =====
+    // ===== Parent Campaign table (G1:K?) =====
     let pr = 1;
-    ws.mergeCells(`G${pr}:J${pr}`);
+    ws.mergeCells(`G${pr}:K${pr}`);
     const pcTitle = ws.getCell(`G${pr}`);
     pcTitle.value = 'Registrations by Parent Campaign';
     pcTitle.font = { name: 'Arial', size: 12, bold: true, color: { argb: NAVY_ARGB } };
     pcTitle.fill = FILL_GRAY;
     pcTitle.alignment = { horizontal: 'center', vertical: 'middle' };
-    applyBorderRange(ws, `G${pr}:J${pr}`, BORDER_THIN);
+    applyBorderRange(ws, `G${pr}:K${pr}`, BORDER_THIN);
     pr++;
 
-    ['Parent Campaign','Registered','Enrolled','Total'].forEach((label, idx) => {
+    ['Parent Campaign','Registered','Enrolled','Cancelled/Other','Total'].forEach((label, idx) => {
       const cell = ws.getCell(`${colLetter(7+idx)}${pr}`);
       cell.value = label;
       cell.font = FONT_HEADER;
@@ -472,12 +497,14 @@
       if (ref_parent && ref_status) {
         ws.getCell(`H${pr}`).value = { formula: `COUNTIFS(${ref_parent},"${escapeFormula(row.name)}",${ref_status},"Registered")` };
         ws.getCell(`I${pr}`).value = { formula: `COUNTIFS(${ref_parent},"${escapeFormula(row.name)}",${ref_status},"Enrolled")` };
+        ws.getCell(`J${pr}`).value = { formula: `COUNTIFS(${ref_parent},"${escapeFormula(row.name)}",${otherClause})` };
       } else {
         ws.getCell(`H${pr}`).value = row.reg;
         ws.getCell(`I${pr}`).value = row.enr;
+        ws.getCell(`J${pr}`).value = 0;
       }
-      ws.getCell(`J${pr}`).value = { formula: `H${pr}+I${pr}` };
-      ['H','I','J'].forEach(c => {
+      ws.getCell(`K${pr}`).value = { formula: `H${pr}+I${pr}+J${pr}` };
+      ['H','I','J','K'].forEach(c => {
         const cell = ws.getCell(`${c}${pr}`);
         cell.font = FONT_BODY;
         cell.alignment = { horizontal: 'center', vertical: 'middle' };
@@ -492,8 +519,9 @@
     ws.getCell(`G${pr}`).value = 'Grand Total';
     ws.getCell(`H${pr}`).value = { formula: parentDetailRows.length ? `SUM(H${parentDetailRows[0]}:H${parentDetailRows[parentDetailRows.length-1]})` : '0' };
     ws.getCell(`I${pr}`).value = { formula: parentDetailRows.length ? `SUM(I${parentDetailRows[0]}:I${parentDetailRows[parentDetailRows.length-1]})` : '0' };
-    ws.getCell(`J${pr}`).value = { formula: `H${pr}+I${pr}` };
-    ['G','H','I','J'].forEach(c => {
+    ws.getCell(`J${pr}`).value = { formula: parentDetailRows.length ? `SUM(J${parentDetailRows[0]}:J${parentDetailRows[parentDetailRows.length-1]})` : '0' };
+    ws.getCell(`K${pr}`).value = { formula: `H${pr}+I${pr}+J${pr}` };
+    ['G','H','I','J','K'].forEach(c => {
       const cell = ws.getCell(`${c}${pr}`);
       cell.fill = FILL_GRAY;
       cell.font = { name: 'Arial', size: 11, bold: true, color: { argb: NAVY_ARGB } };
@@ -504,17 +532,18 @@
     pr++;
     pr++;   // blank gap before Course table
 
-    // ===== Course table (G{pr}:J?) =====
-    ws.mergeCells(`G${pr}:J${pr}`);
+    // ===== Course table (G{pr}:K?) =====
+    const courseTitleRow = pr;
+    ws.mergeCells(`G${pr}:K${pr}`);
     const cTitle = ws.getCell(`G${pr}`);
     cTitle.value = 'Registrations by Course';
     cTitle.font = { name: 'Arial', size: 12, bold: true, color: { argb: NAVY_ARGB } };
     cTitle.fill = FILL_GRAY;
     cTitle.alignment = { horizontal: 'center', vertical: 'middle' };
-    applyBorderRange(ws, `G${pr}:J${pr}`, BORDER_THIN);
+    applyBorderRange(ws, `G${pr}:K${pr}`, BORDER_THIN);
     pr++;
 
-    ['Course','Registered','Enrolled','Total'].forEach((label, idx) => {
+    ['Course','Registered','Enrolled','Cancelled/Other','Total'].forEach((label, idx) => {
       const cell = ws.getCell(`${colLetter(7+idx)}${pr}`);
       cell.value = label;
       cell.font = FONT_HEADER;
@@ -535,12 +564,14 @@
       if (ref_course && ref_status) {
         ws.getCell(`H${pr}`).value = { formula: `COUNTIFS(${ref_course},"${escapeFormula(row.name)}",${ref_status},"Registered")` };
         ws.getCell(`I${pr}`).value = { formula: `COUNTIFS(${ref_course},"${escapeFormula(row.name)}",${ref_status},"Enrolled")` };
+        ws.getCell(`J${pr}`).value = { formula: `COUNTIFS(${ref_course},"${escapeFormula(row.name)}",${otherClause})` };
       } else {
         ws.getCell(`H${pr}`).value = row.reg;
         ws.getCell(`I${pr}`).value = row.enr;
+        ws.getCell(`J${pr}`).value = 0;
       }
-      ws.getCell(`J${pr}`).value = { formula: `H${pr}+I${pr}` };
-      ['H','I','J'].forEach(c => {
+      ws.getCell(`K${pr}`).value = { formula: `H${pr}+I${pr}+J${pr}` };
+      ['H','I','J','K'].forEach(c => {
         const cell = ws.getCell(`${c}${pr}`);
         cell.font = FONT_BODY;
         cell.alignment = { horizontal: 'center', vertical: 'middle' };
@@ -554,8 +585,9 @@
     ws.getCell(`G${pr}`).value = 'Grand Total';
     ws.getCell(`H${pr}`).value = { formula: courseDetailRows.length ? `SUM(H${courseDetailRows[0]}:H${courseDetailRows[courseDetailRows.length-1]})` : '0' };
     ws.getCell(`I${pr}`).value = { formula: courseDetailRows.length ? `SUM(I${courseDetailRows[0]}:I${courseDetailRows[courseDetailRows.length-1]})` : '0' };
-    ws.getCell(`J${pr}`).value = { formula: `H${pr}+I${pr}` };
-    ['G','H','I','J'].forEach(c => {
+    ws.getCell(`J${pr}`).value = { formula: courseDetailRows.length ? `SUM(J${courseDetailRows[0]}:J${courseDetailRows[courseDetailRows.length-1]})` : '0' };
+    ws.getCell(`K${pr}`).value = { formula: `H${pr}+I${pr}+J${pr}` };
+    ['G','H','I','J','K'].forEach(c => {
       const cell = ws.getCell(`${c}${pr}`);
       cell.fill = FILL_GRAY;
       cell.font = { name: 'Arial', size: 11, bold: true, color: { argb: NAVY_ARGB } };
@@ -564,12 +596,29 @@
       if (c !== 'G') cell.numFmt = '#,##0';
     });
 
-    // Chart anchor rows are derived from the table sizes we just emitted.
+    // Hide the Cancelled/Other columns (E for sub-Type table, J for Parent
+    // + Course tables) when the secondary data has no non-Reg/Enr statuses.
+    // Data + formulas remain in the cells; only the visible column is hidden.
+    if (!hasOther) {
+      ws.getColumn(5).hidden  = true;
+      ws.getColumn(10).hidden = true;
+    }
+
+    // Chart anchor rows. Sub-Type chart sits below its table (left side);
+    // Parent + Course charts sit to the RIGHT of their tables (parent table
+    // now spans G-K with the Cancelled/Other column, so the chart goes at
+    // column M = 0-based 12, leaving column L as a one-column visual buffer).
+    // Vertical anchors match each table's title row.
     const subtypeChartAnchorRow = subTableLastRow + 2;
-    const parentChartAnchorRow  = pcTotalRow + 2;
-    const courseChartAnchorRow  = subTableLastRow + 2 + 13;   // matches stitch.py spacing
+    const parentChartAnchorRow  = 1;             // aligned with Parent table title (row 1)
+    const courseChartAnchorRow  = courseTitleRow; // aligned with Course table title
+    const RIGHT_CHART_COL       = 12;            // column M (0-based)
 
     // ===== Embed PNG charts at the anchor rows we just computed =====
+    // Each PNG carries an in-canvas title matching its source-table heading
+    // (Registrations by Sub-Type / Parent Campaign / Course), pulled from
+    // CONFIG.dashboard.labels so they stay in sync with the dashboard cards.
+    const labels = (CONFIG.dashboard && CONFIG.dashboard.labels) || {};
     // Sub-Type detail series (excludes bucket parents).
     const sLabels = [], sReg = [], sEnr = [];
     for (const bkt of Object.keys(agg.subtypeBuckets)) {
@@ -577,15 +626,15 @@
         sLabels.push(r.name); sReg.push(r.reg); sEnr.push(r.enr);
       }
     }
-    const sub    = await renderChartPng('off-subtype', sLabels, sReg, sEnr);
+    const sub    = await renderChartPng('off-subtype', sLabels, sReg, sEnr, { title: labels.chartSubtypeTitle || 'Registrations by Sub-Type' });
     const pLabels = agg.parent.map(r => r.name);
     const pReg    = agg.parent.map(r => r.reg);
     const pEnr    = agg.parent.map(r => r.enr);
-    const parent  = await renderChartPng('off-parent', pLabels, pReg, pEnr);
+    const parent  = await renderChartPng('off-parent', pLabels, pReg, pEnr, { title: labels.chartParentTitle || 'Registrations by Parent Campaign' });
     const cLabels = agg.course.map(r => r.name);
     const cReg    = agg.course.map(r => r.reg);
     const cEnr    = agg.course.map(r => r.enr);
-    const course  = await renderChartPng('off-course', cLabels, cReg, cEnr);
+    const course  = await renderChartPng('off-course', cLabels, cReg, cEnr, { title: labels.chartCourseTitle || 'Registrations by Course' });
 
     // Embed at the exact dimensions the canvas was rendered for so Excel
     // doesn't stretch the bitmap when columns/rows are resized.
@@ -597,13 +646,13 @@
     });
     const parentId = wb.addImage({ base64: parent.dataUrl, extension: 'png' });
     ws.addImage(parentId, {
-      tl:  { col: 6, row: parentChartAnchorRow - 1 },
+      tl:  { col: RIGHT_CHART_COL, row: parentChartAnchorRow - 1 },
       ext: { width: parent.embedW, height: parent.embedH },
       editAs: 'oneCell',
     });
     const courseId = wb.addImage({ base64: course.dataUrl, extension: 'png' });
     ws.addImage(courseId, {
-      tl:  { col: 0, row: courseChartAnchorRow - 1 },
+      tl:  { col: RIGHT_CHART_COL, row: courseChartAnchorRow - 1 },
       ext: { width: course.embedW, height: course.embedH },
       editAs: 'oneCell',
     });
@@ -935,20 +984,23 @@
   // rows on the data sheet auto-updates this view.
   function buildCampaignSummarySheet(wb, ctx) {
     const {
+      STATE,
       FONT_HEADER, FONT_BODY, FILL_NAVY, FILL_LBLUE, FILL_GRAY,
       BORDER_THIN, BORDER_MED_BOTTOM,
       NAVY_ARGB,
       colLetter, escapeFormula,
     } = rs();
 
-    const cmCtx = ctx.sheets['Campaign Members (Focus)'];
-    if (!cmCtx) throw new Error('Campaign Summary builder ran before Campaign Members (Focus).');
-
     const ws = wb.addWorksheet('Campaign Summary', { views: [{ state: 'frozen', ySplit: 3 }] });
+    ws.properties.tabColor = { argb: NAVY_ARGB };
     const data = aggregateCmStatusByCampaign(ctx);
 
     // Structured table references — auto-resize when rows are added/removed.
-    const tbl = cmCtx.tableName;
+    // The CampaignMembers table is created by buildCampaignMembersSheet (the
+    // Focus sheet). Formulas resolve by name at open time, so this sheet can
+    // be ordered ahead of Campaign Members in the tab strip — we just need
+    // both sheets in the final workbook.
+    const tbl         = 'CampaignMembers';
     const refParent   = `${tbl}[Parent Campaign Name]`;
     const refCampaign = `${tbl}[Campaign Name]`;
     const refStatus   = `${tbl}[Course Status]`;
@@ -972,8 +1024,10 @@
       ws.getRow(2).height = 44;
     }
 
-    // Header row 3
-    const headers = ['Parent Campaign', 'Campaign Name', 'Not Converted', 'Cancelled/Withdrawn/Etc', 'Enrolled', 'Registered', 'Total'];
+    // Header row 3 — column D's user-facing label is "Cancelled/Other"; the
+    // underlying COUNTIFS criterion stays the canonical "Cancelled/Withdrawn/Etc"
+    // string deriveCourseStatus emits (locked decision #3).
+    const headers = ['Parent Campaign', 'Campaign Name', 'Not Converted', 'Cancelled/Other', 'Enrolled', 'Registered', 'Total'];
     headers.forEach((h, i) => {
       const cell = ws.getCell(`${colLetter(i+1)}3`);
       cell.value = h;
@@ -983,6 +1037,14 @@
       cell.border = BORDER_THIN;
     });
     ws.getRow(3).height = 32;
+
+    // Hide column D (Cancelled/Other) when the secondary data has no
+    // non-Reg/Enr statuses — formulas stay valid (will just resolve to 0).
+    const hasOther = STATE.stitched.some(s => {
+      const st = (s.secondary['Status'] || '').toString().trim();
+      return st && st !== 'Registered' && st !== 'Enrolled';
+    });
+    if (!hasOther) ws.getColumn(4).hidden = true;
 
     const styleNumCells = (rowNum, opts = {}) => {
       ['C','D','E','F','G'].forEach(col => {
@@ -1225,9 +1287,9 @@
     outputSheets: [
       { name: 'Stitched Data',             builder: buildStitchedSheet },
       { name: 'Participant Summary',       builder: buildParticipantSummarySheet },
+      { name: 'Campaign Summary',          builder: buildCampaignSummarySheet },
       { name: 'Campaign Members (Focus)',  builder: buildCampaignMembersSheet },
       { name: 'Campaign Members (Older)',  builder: buildCampaignMembersOlderSheet },
-      { name: 'Campaign Summary',          builder: buildCampaignSummarySheet },
       // Conditional — builder returns null and no worksheet is added when
       // there are no rejected matches to surface.
       { name: 'Post-Reg Engagement',       builder: buildPostRegEngagementSheet },
@@ -1312,6 +1374,7 @@
 
         // Chart titles + captions
         chartFunnelCaption:     'Click any segment to drill into the matching Campaign Members.',
+        funnelIncludeNotConvertedLabel: 'Include "Not Converted"',
         chartTimeseriesCaption: 'Click any point to drill into the Campaign Members or Participants in that time bin.',
         chartSubtypeTitle:      'Registrations by Sub-Type',
         chartParentTitle:       'Registrations by Parent Campaign',

@@ -1173,6 +1173,29 @@ footer .privacy-note { color: var(--text); font-weight: 500; }
   margin: 0 0 4px;
   letter-spacing: -0.005em;
 }
+.dash-chart-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.dash-chart-head h3 { flex: 0 0 auto; }
+.funnel-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-muted);
+  cursor: pointer;
+  user-select: none;
+}
+.funnel-toggle input[type="checkbox"] {
+  margin: 0;
+  cursor: pointer;
+  accent-color: var(--navy);
+}
+.funnel-toggle:hover { color: var(--text); }
 .chart-caption {
   display: block;
   color: var(--text-muted);

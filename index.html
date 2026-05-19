@@ -305,7 +305,13 @@
 
     <div class="dash-chart-grid">
       <div class="dash-chart-card">
-        <h3>Conversion funnel</h3>
+        <div class="dash-chart-head">
+          <h3>Conversion funnel</h3>
+          <label class="funnel-toggle">
+            <input type="checkbox" id="funnel-include-notconverted" checked>
+            <span data-label="funnelIncludeNotConvertedLabel">Include "Not Converted"</span>
+          </label>
+        </div>
         <small class="chart-caption" id="chart-funnel-caption" data-label="chartFunnelCaption">Click any segment to drill into the matching Campaign Members.</small>
         <div class="chart-canvas-wrap chart-funnel-wrap">
           <canvas id="chart-funnel" aria-label="Conversion funnel chart"></canvas>

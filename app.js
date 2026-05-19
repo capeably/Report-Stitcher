@@ -803,6 +803,17 @@ function buildHorizontalStackedConfig(labels, regSeries, enrSeries, opts = {}) {
         },
       },
       plugins: {
+        // opts.title (e.g. "Registrations by Parent Campaign") is rendered
+        // INSIDE the canvas, so xlsx PNG embeds carry their source-table name
+        // without needing an external label cell. Skipped on in-page charts
+        // (the .dash-chart-card already has an <h3> title above the canvas).
+        title: opts.title ? {
+          display: true,
+          text: opts.title,
+          font: { size: (isPng ? 16 : 14) * scale, family: 'Arial', weight: 'bold' },
+          color: NAVY_HEX,
+          padding: { top: 4 * scale, bottom: 12 * scale },
+        } : { display: false },
         legend: {
           position: 'bottom',
           labels: {
@@ -955,18 +966,25 @@ function openDistributionDrilldown(dimension, dimensionValue, status, filteredPr
   openDrilldown(`${dimensionValue} — ${status} — ${matching.length.toLocaleString()} record${matching.length === 1 ? '' : 's'}`, matching);
 }
 
-async function renderOffscreenChartPng(canvasId, labels, reg, enr) {
+async function renderOffscreenChartPng(canvasId, labels, reg, enr, opts = {}) {
   // Compute embed dimensions FIRST, then render the canvas at the same aspect ratio
   // (scaled up 2x for crisp display in Excel). Matching aspect ratios prevents
   // Excel from stretching the bitmap when the user resizes columns/rows.
+  // opts.title — string rendered inside the canvas as the chart title; embedH
+  //   bumps to leave room without squeezing the plot area.
   const embedW = 720;
-  const embedH = Math.max(280, labels.length * 28 + 100);
+  const titleBump = opts.title ? 40 : 0;
+  const embedH = Math.max(280, labels.length * 28 + 100 + titleBump);
   const scale  = 2;
   const canvas = document.getElementById(canvasId);
   canvas.width  = embedW * scale;
   canvas.height = embedH * scale;
   destroyChart(OFF_CHARTS, canvasId);
-  const cfg = buildHorizontalStackedConfig(labels, reg, enr, { forPng: true, scale });
+  const cfg = buildHorizontalStackedConfig(labels, reg, enr, {
+    forPng: true,
+    scale,
+    title:  opts.title || null,
+  });
   OFF_CHARTS[canvasId] = new Chart(canvas, cfg);
   await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
   return { dataUrl: canvas.toDataURL('image/png'), embedW, embedH };
@@ -1101,7 +1119,19 @@ async function generateFilteredXlsx() {
     throw new Error('No rows match the current filter.');
   }
   const filteredPrimarySet  = new Set(filtered.map(d => d.primary));
-  const filteredStitched    = STATE.stitched.filter(s => filteredPrimarySet.has(s.primary));
+  // Two-pass stitched filter:
+  //   1. Drop matches whose CM was filtered out (parent/sub-type/bucket/status at CM level).
+  //   2. Drop matches whose own bucket is excluded by the courseStatuses chip.
+  //      Needed because deriveCourseStatus picks one canonical bucket per CM
+  //      (best-of across matches), so a multi-match CM with Enrolled+Cancelled
+  //      passes the CM-level filter when only Enrolled is selected — but its
+  //      Cancelled stitched row must still be dropped from the output.
+  let filteredStitched = STATE.stitched.filter(s => filteredPrimarySet.has(s.primary));
+  if (FILTERS.courseStatuses) {
+    filteredStitched = filteredStitched.filter(s =>
+      FILTERS.courseStatuses.has(CONFIG.deriveCourseStatus([s]))
+    );
+  }
   const filteredPrimaryRows = STATE.primary.rows.filter(p => filteredPrimarySet.has(p));
 
   const origStitched     = STATE.stitched;
@@ -1163,6 +1193,10 @@ const DASH = {
   focusMinAvail:      null, focusMaxAvail:      null, focusDefault:      null,
   influenceMinAvail:  null, influenceMaxAvail:  null, influenceDefault:  null,
   funnelChart:    null,
+  // Chart-local toggle: drop the first status (Not Converted for Emory) from
+  // the Conversion Funnel viz without affecting the global filter. Default
+  // true — show all four bars unless the user opts out.
+  funnelIncludeNotConverted: true,
   timeseriesChart:null,
   drillRows:      [],
   drillPage:      0,
@@ -1260,7 +1294,14 @@ function cacheParsedDatesOnRows() {
 /* --- Primary-centric dataset for the dashboard -------------------------- */
 
 function buildPrimaryDataset() {
-  const primaryClean = STATE.primary.rows.filter(r => !CONFIG.testRowFilter(r));
+  // Dashboard scope = primary rows whose date dimension falls within Focus.
+  // The dashboard's framing is "what happened in the Focus window?" — older
+  // CMs (in Influence \ Focus) are still in the stitch and on the Older xlsx
+  // tab, but they don't belong in the headline charts/KPIs/Campaign Summary.
+  const dateOf = CONFIG.dashboard && CONFIG.dashboard.dateOf;
+  const primaryClean = STATE.primary.rows.filter(r =>
+    !CONFIG.testRowFilter(r) && (!dateOf || dateInRange(dateOf.primary(r), FILTERS.focus))
+  );
   const primaryToStitched = new Map();
   for (const s of STATE.stitched) {
     if (!primaryToStitched.has(s.primary)) primaryToStitched.set(s.primary, []);
@@ -1447,7 +1488,7 @@ function initDashboard(opts = {}) {
   FILTERS.parentCampaigns = null;
   FILTERS.subTypes        = null;
   FILTERS.subTypeBuckets  = new Set(CONFIG.dashboard.bucketOptions);
-  FILTERS.courseStatuses  = new Set(['Cancelled/Withdrawn/Etc', 'Registered', 'Enrolled']);
+  FILTERS.courseStatuses  = new Set(CONFIG.dashboard.statusOrder);
 
   // Both date ranges wired through the same helper. Range changes trigger
   // re-stitch (Focus bounds secondary, Influence bounds primary), which in
@@ -1491,12 +1532,22 @@ function initDashboard(opts = {}) {
     refreshDashboard();
   });
 
+  // Conversion Funnel chart-local "Include Not Converted" toggle
+  const funnelToggle = document.getElementById('funnel-include-notconverted');
+  if (funnelToggle) {
+    funnelToggle.checked = DASH.funnelIncludeNotConverted !== false;
+    funnelToggle.onchange = () => {
+      DASH.funnelIncludeNotConverted = funnelToggle.checked;
+      refreshDashboard();
+    };
+  }
+
   // Reset filters — both date ranges back to the auto-filled defaults plus
   // the non-date filters back to their initial state. Triggers a re-stitch
   // since date ranges changed.
   document.getElementById('btn-filter-reset').onclick = () => {
     FILTERS.subTypeBuckets  = new Set(CONFIG.dashboard.bucketOptions);
-    FILTERS.courseStatuses  = new Set(['Cancelled/Withdrawn/Etc', 'Registered', 'Enrolled']);
+    FILTERS.courseStatuses  = new Set(CONFIG.dashboard.statusOrder);
     FILTERS.parentCampaigns = null;
     FILTERS.subTypes        = null;
     DASH.parentSelected     = new Set(DASH.parentList);
@@ -1519,6 +1570,10 @@ function initDashboard(opts = {}) {
     });
     renderParentMultiselect();
     renderSubTypeMultiselect();
+    // Restore funnel toggle to default (include Not Converted) on Reset.
+    DASH.funnelIncludeNotConverted = true;
+    const fnTog = document.getElementById('funnel-include-notconverted');
+    if (fnTog) fnTog.checked = true;
     onDateRangeChange();
   };
 
@@ -1825,23 +1880,35 @@ function renderDashKpis(filtered) {
 /* --- Funnel chart ------------------------------------------------------- */
 
 function renderFunnelChart(filtered) {
-  const counts = { 'Not Converted': 0, 'Cancelled/Withdrawn/Etc': 0, 'Registered': 0, 'Enrolled': 0 };
-  for (const d of filtered) counts[d.courseStatus]++;
-  const total = filtered.length || 1;
-  const pct = (n) => ((n / total) * 100).toFixed(1) + '%';
+  // Chart-local toggle: when off, drop the first status (Not Converted in
+  // Emory's statusOrder) from the visible bars. Percentages re-normalize
+  // against the visible total so the funnel reads cleanly either way.
+  const excluded = CONFIG.dashboard.statusOrder[0];
+  const includeExcluded = DASH.funnelIncludeNotConverted !== false;
+  const visibleStatuses = includeExcluded
+    ? CONFIG.dashboard.statusOrder
+    : CONFIG.dashboard.statusOrder.filter(s => s !== excluded);
+
+  const counts = {};
+  for (const s of visibleStatuses) counts[s] = 0;
+  for (const d of filtered) {
+    if (counts[d.courseStatus] != null) counts[d.courseStatus]++;
+  }
+  const visibleTotal = visibleStatuses.reduce((acc, s) => acc + counts[s], 0) || 1;
+  const pct = (n) => ((n / visibleTotal) * 100).toFixed(1) + '%';
 
   const canvas = document.getElementById('chart-funnel');
   if (DASH.funnelChart) { try { DASH.funnelChart.destroy(); } catch(e) {} DASH.funnelChart = null; }
 
   // Build aria-label dynamically for screen readers
-  const ariaParts = CONFIG.dashboard.statusOrder.map(s => `${s} ${counts[s]}`);
-  canvas.setAttribute('aria-label', `Conversion funnel: total ${filtered.length}, ${ariaParts.join(', ')}`);
+  const ariaParts = visibleStatuses.map(s => `${s} ${counts[s]}`);
+  canvas.setAttribute('aria-label', `Conversion funnel: total ${visibleTotal}, ${ariaParts.join(', ')}`);
 
   DASH.funnelChart = new Chart(canvas, {
     type: 'bar',
     data: {
       labels: ['Funnel'],
-      datasets: CONFIG.dashboard.statusOrder.map(status => ({
+      datasets: visibleStatuses.map(status => ({
         label: `${status} — ${counts[status]} (${pct(counts[status])})`,
         data: [counts[status]],
         backgroundColor: CONFIG.dashboard.statusColor[status],
@@ -1864,7 +1931,7 @@ function renderFunnelChart(filtered) {
         tooltip: {
           callbacks: {
             label: (ctx) => {
-              const s = CONFIG.dashboard.statusOrder[ctx.datasetIndex];
+              const s = visibleStatuses[ctx.datasetIndex];
               return `${s}: ${ctx.raw.toLocaleString()} (${pct(ctx.raw)})`;
             },
           },
@@ -1872,7 +1939,7 @@ function renderFunnelChart(filtered) {
       },
       onClick: (evt, elements) => {
         if (!elements.length) return;
-        const status = CONFIG.dashboard.statusOrder[elements[0].datasetIndex];
+        const status = visibleStatuses[elements[0].datasetIndex];
         const matching = filtered.filter(d => d.courseStatus === status);
         openDrilldown(`${status} — ${matching.length.toLocaleString()} Campaign Member${matching.length === 1 ? '' : 's'}`, matching);
       },
@@ -1910,14 +1977,14 @@ function funnelLabelPlugin() {
 
 function renderTimeSeriesChart(filtered) {
   // CM acquisition (primaryActivity) and PA conversion (secondaryCreated), filtered cohort only.
-  // X-axis spans Influence (the wider window) so CM lookback is visible; the
-  // PA-conversion line naturally falls inside Focus since stitch is Focus-bounded.
+  // X-axis spans Focus — dashboard charts are all Focus-scoped (CMs and PAs
+  // in `filtered` are already in Focus via buildPrimaryDataset's filter).
   const primaryDates = filtered.filter(d => d.primaryActivity).map(d => d.primaryActivity);
   const secondaryDates = filtered.filter(d => d.secondaryCreated).map(d => d.secondaryCreated);
 
-  const infMin = FILTERS.influence.dateMin;
-  const infMax = FILTERS.influence.dateMax;
-  const rangeMs = (infMax && infMin) ? infMax - infMin : 0;
+  const focMin = FILTERS.focus.dateMin;
+  const focMax = FILTERS.focus.dateMax;
+  const rangeMs = (focMax && focMin) ? focMax - focMin : 0;
   const days = rangeMs / ONE_DAY;
   const bin = days < 60 ? 'day' : days < 540 ? 'week' : 'month';
   const binStart = bin === 'day' ? startOfDay : bin === 'week' ? startOfWeek : startOfMonth;
@@ -1927,9 +1994,9 @@ function renderTimeSeriesChart(filtered) {
     return new Date(start.getFullYear(), start.getMonth() + 1, 1);
   };
 
-  // Build bin sequence covering Influence (or fall back to whatever dates we have)
-  const startBin = infMin ? binStart(infMin) : (primaryDates.length || secondaryDates.length ? binStart(new Date(Math.min(...[...primaryDates, ...secondaryDates].map(d => d.getTime())))) : new Date());
-  const endBin   = infMax ? binStart(infMax) : startBin;
+  // Build bin sequence covering Focus (or fall back to whatever dates we have)
+  const startBin = focMin ? binStart(focMin) : (primaryDates.length || secondaryDates.length ? binStart(new Date(Math.min(...[...primaryDates, ...secondaryDates].map(d => d.getTime())))) : new Date());
+  const endBin   = focMax ? binStart(focMax) : startBin;
   const bins = [];
   for (let cur = new Date(startBin.getTime()); cur <= endBin; cur = binAdvance(cur)) {
     bins.push(cur.getTime());
